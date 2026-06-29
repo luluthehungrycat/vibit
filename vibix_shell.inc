@@ -263,7 +263,8 @@ readline:
     add rsp, 16
 
     test rax, rax
-    jle .eof                        ; EOF or error → end of input
+    jl .eof                         ; error → end of input
+    jz .readline_loop               ; no data yet (non-blocking TTY), retry
 
     mov al, [rsp - 16]              ; reload the byte we read
 
