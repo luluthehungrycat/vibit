@@ -145,17 +145,27 @@ service_init:
     ret
 
 ;==============================================================================
-; service_shell — launch interactive shell as child
+; service_shell — launch vish interactive shell via exec
 ;
-; Called in child process context (after fork).  Jumps to shell entry,
-; which never returns (shell calls exit() on "exit" command).
+; Called in child process context (after fork).  Replaces the child with
+; vish via the exec() syscall.  If exec fails, exits with code 1.
 ;==============================================================================
 service_shell:
     lea rsi, [str_svc_shell_msg]
     call print
     lea rsi, [str_newline]
     call print
-    jmp shell                           ; defined in vibix_shell.inc
+    ; exec("/bin/vish", ["vish", NULL], envp)
+    lea rdi, [rel str_path_vish]
+    lea rsi, [rel vish_argv]
+    mov rdx, [rel saved_envp]
+    mov rax, SYS_EXEC
+    syscall
+    ; Exec failed — exit with code 1
+    xor edi, edi
+    inc rdi                              ; exit(1)
+    xor eax, eax                         ; SYS_EXIT
+    syscall
 
 ;==============================================================================
 ; spawn_all — fork a child for every spawnable service in svc_table
@@ -480,7 +490,6 @@ shutdown_flag: dq SHUTDOWN_NONE
 ;
 ; These must come in this order: core and tiny provide utility functions
 ; and constants referenced by echo, cat, printenv, clear.
-; Shell must be last (references labels from all of the above).
 ;==============================================================================
 %include "vibix_core.inc"
 %include "vibix_tiny.inc"
@@ -488,4 +497,11 @@ shutdown_flag: dq SHUTDOWN_NONE
 %include "vibix_cat.inc"
 %include "vibix_printenv.inc"
 %include "vibix_clear.inc"
-%include "vibix_shell.inc"
+
+; argv for vish exec
+vish_argv:
+    dq str_vish_name
+    dq 0                                 ; null-terminated
+
+str_path_vish:  db "/bin/vish", 0
+str_vish_name:  db "vish", 0
