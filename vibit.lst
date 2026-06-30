@@ -1,0 +1,2050 @@
+     1                                  ;==============================================================================
+     2                                  ; vibit.asm — VIBIT: VIBIX Init and Service Manager (PID 1)
+     3                                  ;
+     4                                  ; Version 0.2.0
+     5                                  ;
+     6                                  ; Architecture:
+     7                                  ;   _start → getpid() → PID 1: spawn services, reaper loop with respawn
+     8                                  ;                      → non-PID-1: dispatch via r12 to service function
+     9                                  ;
+    10                                  ; Service dispatch via r12 convention:
+    11                                  ;   Parent sets r12 = SERVICE_ID before sys_fork.
+    12                                  ;   r12 is preserved through fork (kernel copies register state).
+    13                                  ;   Child reads r12 → dispatches to function from service table.
+    14                                  ;
+    15                                  ; Shutdown IPC:
+    16                                  ;   Shell writes to shutdown_flag in shared address space
+    17                                  ;   (no per-process page tables in VIBIX — all processes share same map).
+    18                                  ;   PID 1 checks flag on each iteration of reaper loop.
+    19                                  ;
+    20                                  ; Build:
+    21                                  ;   nasm -f bin -o vibit.bin vibit.asm -I ./
+    22                                  ;
+    23                                  ; For VIBIX integration, copy vibit.bin as userspace/vibix_blob.bin.
+    24                                  ;==============================================================================
+    25                                  
+    26                                  ; ── Assembler directives ──────────────────────────────────────────────────────
+    27                                  default rel
+    28                                  ORG 0x2000000
+    29                                  bits 64
+    30                                  
+    31                                  ;==============================================================================
+    32                                  ; Syscall numbers (VIBIX kernel ABI)
+    33                                  ;==============================================================================
+    34                                  SYS_EXIT       equ 0
+    35                                  SYS_WRITE      equ 1
+    36                                  SYS_READ       equ 2
+    37                                  SYS_GETPID     equ 3
+    38                                  SYS_NANOSLEEP  equ 5
+    39                                  SYS_REBOOT     equ 7
+    40                                  SYS_FORK       equ 8
+    41                                  SYS_EXEC       equ 9
+    42                                  SYS_WAITPID    equ 10
+    43                                  
+    44                                  ;==============================================================================
+    45                                  ; Reboot magic constants (Linux-compatible, VIBIX syscall 7)
+    46                                  ;==============================================================================
+    47                                  REBOOT_MAGIC    equ 0xfee1dead
+    48                                  REBOOT_MAGIC2   equ 0x28121969
+    49                                  REBOOT_POWEROFF equ 0x4321fedc
+    50                                  REBOOT_RESTART  equ 0xcdef0123
+    51                                  
+    52                                  ;==============================================================================
+    53                                  ; Shutdown flag values — written by child processes, polled by PID 1
+    54                                  ;==============================================================================
+    55                                  SHUTDOWN_NONE     equ 0
+    56                                  SHUTDOWN_REBOOT   equ 1
+    57                                  SHUTDOWN_POWEROFF equ 2
+    58                                  
+    59                                  ;==============================================================================
+    60                                  ; Service descriptor structure (3 qwords per entry)
+    61                                  ;==============================================================================
+    62                                  SVC_FUNC  equ 0         ; entry function pointer
+    63                                  SVC_NAME  equ 8         ; name string pointer
+    64                                  SVC_FLAGS equ 16        ; flags (bit 0 = respawn on exit)
+    65                                  SVC_SIZE  equ 24
+    66                                  
+    67                                  ;==============================================================================
+    68                                  ; Service IDs
+    69                                  ;==============================================================================
+    70                                  SVC_INIT  equ 0         ; PID 1 boot task (not spawned as child)
+    71                                  SVC_SHELL equ 1         ; Interactive shell (respawnable)
+    72                                  
+    73                                  ;==============================================================================
+    74                                  ; Code section
+    75                                  ;==============================================================================
+    76                                  section .text
+    77                                  global _start
+    78                                  
+    79                                  ;==============================================================================
+    80                                  ; _start — entry point (initial boot and exec restart)
+    81                                  ;
+    82                                  ; Initial boot (PID 1):  init banner, run init tasks, spawn services, reaper
+    83                                  ; Child process:         dispatch via r12 to service function
+    84                                  ;==============================================================================
+    85                                  _start:
+    86 00000000 B803000000                  mov rax, SYS_GETPID
+    87 00000005 0F05                        syscall
+    88                                  
+    89 00000007 4883F801                    cmp rax, 1
+    90 0000000B 7423                        je .init
+    91                                  
+    92                                      ; ── Child process dispatch ──
+    93                                      ; r12 = service_id (set by parent before fork, preserved through fork)
+    94                                      ; After exec(): kernel resets RIP to 0x2000000, but user registers
+    95                                      ; (including r12) are preserved from the exec'ing process.  If r12
+    96                                      ; is out of range OR equals SVC_INIT (0, reserved for PID 1), we
+    97                                      ; fall through to the default shell service.
+    98 0000000D 4983FC02                    cmp r12, svc_count
+    99 00000011 7305                        jae .set_shell_fallback
+   100 00000013 4D85E4                      test r12, r12                   ; SVC_INIT (0) is PID 1 only
+   101 00000016 7506                        jnz .do_dispatch
+   102                                  .set_shell_fallback:
+   103 00000018 41BC01000000                mov r12, SVC_SHELL              ; fallback to shell
+   104                                  .do_dispatch:
+   105 0000001E BC00300002                  mov rsp, 0x2003000              ; fresh stack for service
+   106 00000023 496BDC18                    imul rbx, r12, SVC_SIZE         ; rbx = service_id * 24
+   107 00000027 488B83[62000000]            mov rax, [svc_table + rbx + SVC_FUNC]
+   108 0000002E FFE0                        jmp rax                         ; jump to service (never returns)
+   109                                  
+   110                                  .init:
+   111                                      ; ── Init (PID 1) ──
+   112 00000030 48C705090400000000-         mov qword [rel shutdown_flag], SHUTDOWN_NONE
+   112 00000039 0000               
+   113                                  
+   114 0000003B 488D35CB020000              lea rsi, [str_banner]
+   115 00000042 E833020000                  call print
+   116                                  
+   117                                      ; Run the init boot task (one-shot, returns)
+   118 00000047 E846000000                  call service_init
+   119                                  
+   120                                      ; Spawn all services as child processes
+   121 0000004C E86B000000                  call spawn_all
+   122                                  
+   123                                      ; Enter reaper loop (blocks on waitpid, never returns)
+   124 00000051 488D35F6020000              lea rsi, [str_reaper]
+   125 00000058 E81D020000                  call print
+   126 0000005D E9D8000000                  jmp reaper_loop
+   127                                  
+   128                                  ;==============================================================================
+   129                                  ; Service table — defines all runnable services
+   130                                  ;==============================================================================
+   131                                  svc_table:
+   132 00000062 [9200000000000000]-         dq service_init,  str_svc_init,  0    ; SVC_INIT (PID 1 internal)
+   132 0000006A [E403000000000000]-
+   132 00000072 0000000000000000   
+   133 0000007A [9F00000000000000]-         dq service_shell, str_svc_shell, 1    ; SVC_SHELL (respawnable)
+   133 00000082 [E903000000000000]-
+   133 0000008A 0100000000000000   
+   134                                  svc_count equ ($ - svc_table) / SVC_SIZE
+   135                                  
+   136                                  ;==============================================================================
+   137                                  ; service_init — one-shot boot task (runs as part of PID 1 init sequence)
+   138                                  ;
+   139                                  ; Returns to caller.  In production this would mount filesystems,
+   140                                  ; set up devices, etc.  Currently a placeholder.
+   141                                  ;==============================================================================
+   142                                  service_init:
+   143 00000092 488D3556030000              lea rsi, [str_svc_init_msg]
+   144 00000099 E8DC010000                  call print
+   145 0000009E C3                          ret
+   146                                  
+   147                                  ;==============================================================================
+   148                                  ; service_shell — launch interactive shell as child
+   149                                  ;
+   150                                  ; Called in child process context (after fork).  Jumps to shell entry,
+   151                                  ; which never returns (shell calls exit() on "exit" command).
+   152                                  ;==============================================================================
+   153                                  service_shell:
+   154 0000009F 488D3564030000              lea rsi, [str_svc_shell_msg]
+   155 000000A6 E8CF010000                  call print
+   156 000000AB 488D351E040000              lea rsi, [str_newline]
+   157 000000B2 E8C3010000                  call print
+   158 000000B7 E97B070000                  jmp shell                           ; defined in vibix_shell.inc
+   159                                  
+   160                                  ;==============================================================================
+   161                                  ; spawn_all — fork a child for every spawnable service in svc_table
+   162                                  ;
+   163                                  ; Skips SVC_INIT (PID 1 runs it directly).  For each other service:
+   164                                  ;   set r12 = service_id
+   165                                  ;   fork
+   166                                  ;   parent: continue to next service
+   167                                  ;   child:  reset stack, dispatch to service function
+   168                                  ;==============================================================================
+   169                                  spawn_all:
+   170 000000BC 53                          push rbx
+   171 000000BD 4154                        push r12
+   172                                  
+   173 000000BF 4531E4                      xor r12d, r12d
+   174                                  .loop:
+   175 000000C2 4983FC02                    cmp r12, svc_count
+   176 000000C6 736E                        jae .done
+   177                                  
+   178                                      ; Skip SVC_INIT (it's for PID 1, not a child process)
+   179 000000C8 4D85E4                      test r12, r12
+   180 000000CB 7464                        jz .next
+   181                                  
+   182                                      ; Announce spawn
+   183 000000CD 488D3553020000              lea rsi, [str_spawn]
+   184 000000D4 E8A1010000                  call print
+   185 000000D9 496BCC18                    imul rcx, r12, SVC_SIZE         ; rcx = service_id * 24
+   186 000000DD 488BB1[6A000000]            mov rsi, [svc_table + rcx + SVC_NAME]
+   187 000000E4 E891010000                  call print
+   188                                  
+   189                                      ; Save current service_id to global for the child.
+   190                                      ; VIBIX fork zeros all user registers in the child frame, so r12
+   191                                      ; won't survive the syscall.  The child reads spawn_id to dispatch.
+   192 000000E9 4C89254C030000              mov [rel spawn_id], r12
+   193                                  
+   194 000000F0 B808000000                  mov rax, SYS_FORK
+   195 000000F5 0F05                        syscall
+   196                                  
+   197 000000F7 4885C0                      test rax, rax
+   198 000000FA 7410                        jz .child                           ; child: rax = 0
+   199 000000FC 7C27                        jl .error                           ; error: rax < 0
+   200                                  
+   201                                      ; Parent: announce success
+   202 000000FE 488D3533020000              lea rsi, [str_done]
+   203 00000105 E870010000                  call print
+   204 0000010A EB25                        jmp .next
+   205                                  
+   206                                  .child:
+   207 0000010C BC00300002                  mov rsp, 0x2003000
+   208 00000111 4C8B2524030000              mov r12, [rel spawn_id]             ; restore service_id (fork zeros r12)
+   209 00000118 496BDC18                    imul rbx, r12, SVC_SIZE            ; rbx = service_id * 24
+   210 0000011C 488B83[62000000]            mov rax, [svc_table + rbx + SVC_FUNC]
+   211 00000123 FFE0                        jmp rax                             ; never returns
+   212                                  
+   213                                  .error:
+   214 00000125 488D3516020000              lea rsi, [str_fail]
+   215 0000012C E849010000                  call print
+   216                                  
+   217                                  .next:
+   218 00000131 49FFC4                      inc r12
+   219 00000134 EB8C                        jmp .loop
+   220                                  
+   221                                  .done:
+   222 00000136 415C                        pop r12
+   223 00000138 5B                          pop rbx
+   224 00000139 C3                          ret
+   225                                  
+   226                                  ;==============================================================================
+   227                                  ; reaper_loop — infinite waitpid(-1) loop with respawn and shutdown
+   228                                  ;
+   229                                  ; On each child exit:
+   230                                  ;   1. Reap the zombie
+   231                                  ;   2. Check shutdown flag (child may have set it)
+   232                                  ;   3. If flag set → poweroff or reboot
+   233                                  ;   4. If shell exited → respawn a new instance
+   234                                  ;
+   235                                  ; waitpid detail: RAX=0 when blocked parent resumes (kernel limitation).
+   236                                  ; We just retry the waitpid.
+   237                                  ;==============================================================================
+   238                                  reaper_loop:
+   239                                  .loop:
+   240                                      ; Check shutdown flag (non-blocking poll before waitpid)
+   241 0000013A 4C8B0503030000              mov r8, [rel shutdown_flag]
+   242 00000141 4D85C0                      test r8, r8
+   243 00000144 0F85BD000000                jnz .shutdown
+   244                                  
+   245                                      ; waitpid(-1, NULL, 0) — blocks until a child exits
+   246 0000014A B80A000000                  mov rax, SYS_WAITPID
+   247 0000014F 31FF                        xor edi, edi
+   248 00000151 48FFCF                      dec rdi                         ; pid = -1 (any child)
+   249 00000154 31F6                        xor esi, esi                    ; wstatus = NULL
+   250 00000156 31D2                        xor edx, edx                    ; flags = 0 (blocking)
+   251 00000158 0F05                        syscall
+   252                                  
+   253 0000015A 4883F8FF                    cmp rax, -1
+   254 0000015E 0F8484000000                je .no_children
+   255                                  
+   256 00000164 4885C0                      test rax, rax
+   257 00000167 74D1                        jz .loop                        ; RAX=0: was blocked, retry
+   258                                  
+   259                                      ; ── Reaped child PID in rax ──
+   260 00000169 50                          push rax
+   261 0000016A 488D35F1010000              lea rsi, [str_reaped]
+   262 00000171 E804010000                  call print
+   263 00000176 58                          pop rax
+   264 00000177 E82A010000                  call print_decimal
+   265 0000017C 488D354D030000              lea rsi, [str_newline]
+   266 00000183 E8F2000000                  call print
+   267                                  
+   268                                      ; Check shutdown flag (child may have set it before exiting)
+   269 00000188 4C8B05B5020000              mov r8, [rel shutdown_flag]
+   270 0000018F 4D85C0                      test r8, r8
+   271 00000192 7573                        jnz .shutdown
+   272                                  
+   273                                      ; Respawn shell
+   274 00000194 488D35DC010000              lea rsi, [str_respawn]
+   275 0000019B E8DA000000                  call print
+   276                                  
+   277 000001A0 41BC01000000                mov r12, SVC_SHELL
+   278 000001A6 B808000000                  mov rax, SYS_FORK
+   279 000001AB 0F05                        syscall
+   280                                  
+   281 000001AD 4885C0                      test rax, rax
+   282 000001B0 7413                        jz .child_respawn
+   283 000001B2 7C23                        jl .respawn_error
+   284                                  
+   285 000001B4 488D357D010000              lea rsi, [str_done]
+   286 000001BB E8BA000000                  call print
+   287 000001C0 E975FFFFFF                  jmp .loop
+   288                                  
+   289                                  .child_respawn:
+   290                                      ; Dispatch through the service table — same path as spawn_all's children.
+   291                                      ; r12 = SVC_SHELL was set before fork above, but we load from the table
+   292                                      ; directly for clarity and to keep the dispatch logic in one place.
+   293 000001C5 BC00300002                  mov rsp, 0x2003000
+   294 000001CA 488D1D91FEFFFF              lea rbx, [svc_table]
+   295 000001D1 488B4318                    mov rax, [rbx + SVC_SHELL * SVC_SIZE + SVC_FUNC]
+   296 000001D5 FFE0                        jmp rax
+   297                                  
+   298                                  .respawn_error:
+   299 000001D7 488D35B4010000              lea rsi, [str_respawn_fail]
+   300 000001DE E897000000                  call print
+   301 000001E3 E952FFFFFF                  jmp .loop
+   302                                  
+   303                                  .no_children:
+   304 000001E8 488D35BA010000              lea rsi, [str_none]
+   305 000001EF E886000000                  call print
+   306                                      ; nanosleep(1, 0) — wait a bit before retrying
+   307 000001F4 B805000000                  mov rax, SYS_NANOSLEEP
+   308 000001F9 BF01000000                  mov rdi, 1
+   309 000001FE 31F6                        xor esi, esi
+   310 00000200 0F05                        syscall
+   311 00000202 E933FFFFFF                  jmp .loop
+   312                                  
+   313                                  .shutdown:
+   314 00000207 488D3513020000              lea rsi, [str_shutdown_msg]
+   315 0000020E E867000000                  call print
+   316 00000213 4C8B052A020000              mov r8, [rel shutdown_flag]
+   317 0000021A 4983F801                    cmp r8, SHUTDOWN_REBOOT
+   318 0000021E 740A                        je .do_reboot
+   319 00000220 E80F000000                  call poweroff
+   320 00000225 E910FFFFFF                  jmp .loop
+   321                                  .do_reboot:
+   322 0000022A E828000000                  call reboot
+   323 0000022F E906FFFFFF                  jmp .loop
+   324                                  
+   325                                  ;==============================================================================
+   326                                  ; poweroff — syscall 7 with REBOOT_POWEROFF
+   327                                  ;==============================================================================
+   328                                  poweroff:
+   329 00000234 488D3589010000              lea rsi, [str_poweroff]
+   330 0000023B E83A000000                  call print
+   331 00000240 B807000000                  mov rax, SYS_REBOOT
+   332 00000245 BFADDEE1FE                  mov rdi, REBOOT_MAGIC
+   333 0000024A BE69191228                  mov rsi, REBOOT_MAGIC2
+   334 0000024F BADCFE2143                  mov rdx, REBOOT_POWEROFF
+   335 00000254 0F05                        syscall
+   336 00000256 C3                          ret
+   337                                  
+   338                                  ;==============================================================================
+   339                                  ; reboot — syscall 7 with REBOOT_RESTART
+   340                                  ;==============================================================================
+   341                                  reboot:
+   342 00000257 488D3577010000              lea rsi, [str_reboot]
+   343 0000025E E817000000                  call print
+   344 00000263 B807000000                  mov rax, SYS_REBOOT
+   345 00000268 BFADDEE1FE                  mov rdi, REBOOT_MAGIC
+   346 0000026D BE69191228                  mov rsi, REBOOT_MAGIC2
+   347 00000272 BA2301EFCD                  mov rdx, REBOOT_RESTART
+   348 00000277 0F05                        syscall
+   349 00000279 C3                          ret
+   350                                  
+   351                                  ;==============================================================================
+   352                                  ; print — write null-terminated string to stdout
+   353                                  ;
+   354                                  ; IN:  rsi = pointer to null-terminated string
+   355                                  ; OUT: (none)
+   356                                  ; CLOBBERS: rax, rcx, rdx, r11
+   357                                  ;==============================================================================
+   358                                  print:
+   359 0000027A 53                          push rbx
+   360 0000027B 4154                        push r12
+   361 0000027D 4155                        push r13
+   362 0000027F 4156                        push r14
+   363 00000281 4157                        push r15
+   364 00000283 56                          push rsi                        ; save string pointer for syscall
+   365 00000284 4889F7                      mov rdi, rsi                    ; strlen expects rdi
+   366 00000287 E8E9010000                  call strlen
+   367 0000028C 4889C2                      mov rdx, rax                    ; length
+   368 0000028F 5E                          pop rsi                         ; restore string pointer
+   369 00000290 B801000000                  mov rax, SYS_WRITE
+   370 00000295 BF01000000                  mov rdi, 1                      ; stdout
+   371 0000029A 0F05                        syscall
+   372 0000029C 415F                        pop r15
+   373 0000029E 415E                        pop r14
+   374 000002A0 415D                        pop r13
+   375 000002A2 415C                        pop r12
+   376 000002A4 5B                          pop rbx
+   377 000002A5 C3                          ret
+   378                                  
+   379                                  ;==============================================================================
+   380                                  ; print_decimal — print unsigned 64-bit decimal to stdout
+   381                                  ;
+   382                                  ; IN:  rax = value to print
+   383                                  ; OUT: (none)
+   384                                  ; CLOBBERS: rax, rcx, rdx, r11
+   385                                  ;==============================================================================
+   386                                  print_decimal:
+   387 000002A6 53                          push rbx
+   388 000002A7 4154                        push r12
+   389 000002A9 4155                        push r13
+   390 000002AB 4156                        push r14
+   391 000002AD 4157                        push r15
+   392 000002AF 4883EC18                    sub rsp, 24
+   393 000002B3 4C8D6C2416                  lea r13, [rsp + 22]
+   394 000002B8 41C6450100                  mov byte [r13 + 1], 0
+   395 000002BD 4989C6                      mov r14, rax
+   396 000002C0 41BF0A000000                mov r15, 10
+   397                                  .convert:
+   398 000002C6 31D2                        xor edx, edx
+   399 000002C8 4C89F0                      mov rax, r14
+   400 000002CB 49F7F7                      div r15
+   401 000002CE 80C230                      add dl, '0'
+   402 000002D1 41885500                    mov [r13], dl
+   403 000002D5 49FFCD                      dec r13
+   404 000002D8 4989C6                      mov r14, rax
+   405 000002DB 4885C0                      test rax, rax
+   406 000002DE 75E6                        jnz .convert
+   407 000002E0 49FFC5                      inc r13
+   408 000002E3 4C89EE                      mov rsi, r13
+   409 000002E6 BF01000000                  mov rdi, 1
+   410 000002EB E885010000                  call strlen
+   411 000002F0 4889C2                      mov rdx, rax
+   412 000002F3 B801000000                  mov rax, SYS_WRITE
+   413 000002F8 BF01000000                  mov rdi, 1
+   414 000002FD 0F05                        syscall
+   415 000002FF 4883C418                    add rsp, 24
+   416 00000303 415F                        pop r15
+   417 00000305 415E                        pop r14
+   418 00000307 415D                        pop r13
+   419 00000309 415C                        pop r12
+   420 0000030B 5B                          pop rbx
+   421 0000030C C3                          ret
+   422                                  
+   423                                  ;==============================================================================
+   424                                  ; String constants
+   425                                  ;==============================================================================
+   426 0000030D 56494249542076302E-     str_banner:        db "VIBIT v0.2.0: PID 1 init", 0x0A, 0
+   426 00000316 322E303A2050494420-
+   426 0000031F 3120696E69740A00   
+   427 00000327 56494249543A207370-     str_spawn:         db "VIBIT: spawning ", 0
+   427 00000330 61776E696E672000   
+   428 00000338 202E2E2E646F6E650A-     str_done:          db " ...done", 0x0A, 0
+   428 00000341 00                 
+   429 00000342 202E2E2E6661696C65-     str_fail:          db " ...failed", 0x0A, 0
+   429 0000034B 640A00             
+   430 0000034E 56494249543A207265-     str_reaper:        db "VIBIT: reaper loop", 0x0A, 0
+   430 00000357 61706572206C6F6F70-
+   430 00000360 0A00               
+   431 00000362 56494249543A207265-     str_reaped:        db "VIBIT: reaped child ", 0
+   431 0000036B 61706564206368696C-
+   431 00000374 642000             
+   432 00000377 56494249543A207265-     str_respawn:       db "VIBIT: respawning shell...", 0
+   432 00000380 737061776E696E6720-
+   432 00000389 7368656C6C2E2E2E00 
+   433 00000392 56494249543A207265-     str_respawn_fail:  db "VIBIT: respawn failed", 0x0A, 0
+   433 0000039B 737061776E20666169-
+   433 000003A4 6C65640A00         
+   434 000003A9 56494249543A206E6F-     str_none:          db "VIBIT: no children (idle)", 0x0A, 0
+   434 000003B2 206368696C6472656E-
+   434 000003BB 202869646C65290A00 
+   435 000003C4 56494249543A20706F-     str_poweroff:      db "VIBIT: poweroff", 0x0A, 0
+   435 000003CD 7765726F66660A00   
+   436 000003D5 56494249543A207265-     str_reboot:        db "VIBIT: reboot", 0x0A, 0
+   436 000003DE 626F6F740A00       
+   437 000003E4 696E697400              str_svc_init:      db "init", 0
+   438 000003E9 7368656C6C00            str_svc_shell:     db "shell", 0
+   439 000003EF 56494249543A20696E-     str_svc_init_msg:  db "VIBIT: init task complete", 0x0A, 0
+   439 000003F8 6974207461736B2063-
+   439 00000401 6F6D706C6574650A00 
+   440 0000040A 56494249543A207374-     str_svc_shell_msg: db "VIBIT: starting shell", 0x0A, 0
+   440 00000413 617274696E67207368-
+   440 0000041C 656C6C0A00         
+   441 00000421 56494249543A207368-     str_shutdown_msg:  db "VIBIT: shutdown requested", 0x0A, 0
+   441 0000042A 7574646F776E207265-
+   441 00000433 717565737465640A00 
+   442                                  
+   443                                  ; ── Spawn IPC (fork service_id passthrough) ──────────────────────────────────
+   444                                  ; VIBIX fork zeros all user registers in the child's register frame.
+   445                                  ; We save the service_id here before SYS_FORK so the child can read it.
+   446 0000043C 0000000000000000        spawn_id: dq 0
+   447                                  
+   448                                  ; ── Shutdown IPC flag (protocol address for vish) ──────────────────────────
+   449                                  ;
+   450                                  ; Protocol:
+   451                                  ;   Any process writes one of the SHUTDOWN_* values below to this flag.
+   452                                  ;   PID 1 polls it on each iteration of the reaper loop (before and after
+   453                                  ;   waitpid).  When non-zero, PID 1 prints the shutdown message and calls
+   454                                  ;   sys_reboot with the appropriate magic.
+   455                                  ;
+   456                                  ;   Address: Fixed offset in the flat binary at 0x2000000.  Because VIBIX
+   457                                  ;   has no per-process page tables, all processes share the same address
+   458                                  ;   space — a write from any child is instantly visible to PID 1.
+   459                                  ;
+   460                                  ;   Values:  SHUTDOWN_NONE=0    (no action)
+   461                                  ;            SHUTDOWN_REBOOT=1  (calls reboot → sys_reboot RESTART)
+   462                                  ;            SHUTDOWN_POWEROFF=2 (calls poweroff → sys_reboot POWEROFF)
+   463                                  ;
+   464                                  ;   vish (vibix_shell.inc) writes to this via RIP-relative addressing:
+   465                                  ;       mov dword [rel shutdown_flag], SHUTDOWN_POWEROFF
+   466                                  ;       mov dword [rel shutdown_flag], SHUTDOWN_REBOOT
+   467                                  ;
+   468                                  ;   PID 1 reads it in reaper_loop:
+   469                                  ;       mov r8, [rel shutdown_flag]
+   470                                  ;       test r8, r8
+   471                                  ;       jnz .shutdown
+   472                                  ;=======================================================================;
+   473 00000444 0000000000000000        shutdown_flag: dq SHUTDOWN_NONE
+   474                                  
+   475                                  ;==============================================================================
+   476                                  ; Include shared VIBIX service implementations
+   477                                  ;
+   478                                  ; These must come in this order: core and tiny provide utility functions
+   479                                  ; and constants referenced by echo, cat, printenv, clear.
+   480                                  ; Shell must be last (references labels from all of the above).
+   481                                  ;==============================================================================
+   482                                  %include "vibix_core.inc"
+     1                              <1> ; int write_str(int fd, const char *buf)
+     2                              <1> ; Writes a null-terminated string to fd. Returns bytes written.
+     3                              <1> write_str:
+     4 0000044C 53                  <1>     push rbx
+     5 0000044D 4154                <1>     push r12
+     6 0000044F 4155                <1>     push r13
+     7 00000451 4156                <1>     push r14
+     8 00000453 4157                <1>     push r15
+     9 00000455 57                  <1>     push rdi                        ; save fd
+    10 00000456 56                  <1>     push rsi                        ; save buf
+    11 00000457 4889F7              <1>     mov rdi, rsi                    ; strlen expects buf in rdi
+    12 0000045A E816000000          <1>     call strlen
+    13 0000045F 4889C2              <1>     mov rdx, rax
+    14 00000462 5E                  <1>     pop rsi
+    15 00000463 5F                  <1>     pop rdi
+    16 00000464 B801000000          <1>     mov rax, 1          ; SYS_WRITE
+    17 00000469 0F05                <1>     syscall
+    18 0000046B 415F                <1>     pop r15
+    19 0000046D 415E                <1>     pop r14
+    20 0000046F 415D                <1>     pop r13
+    21 00000471 415C                <1>     pop r12
+    22 00000473 5B                  <1>     pop rbx
+    23 00000474 C3                  <1>     ret
+    24                              <1> 
+    25                              <1> ; int strlen(const char *s)  — rdi=s, rax=length
+    26                              <1> %ifndef VIBIX_STRLEN
+    27                              <1> %define VIBIX_STRLEN
+    28                              <1> strlen:
+    29 00000475 31C0                <1>     xor eax, eax
+    30                              <1> .l:
+    31 00000477 803C0700            <1>     cmp byte [rdi + rax], 0
+    32 0000047B 7405                <1>     je .d
+    33 0000047D 48FFC0              <1>     inc rax
+    34 00000480 EBF5                <1>     jmp .l
+    35                              <1> .d:
+    36 00000482 C3                  <1>     ret
+    37                              <1> %endif
+    38                              <1> 
+    39                              <1> ; void write_newline(void)  — writes "\n" to stdout
+    40                              <1> write_newline:
+    41 00000483 53                  <1>     push rbx
+    42 00000484 4154                <1>     push r12
+    43 00000486 4155                <1>     push r13
+    44 00000488 4156                <1>     push r14
+    45 0000048A 4157                <1>     push r15
+    46 0000048C 488D353D000000      <1>     lea rsi, [rel str_newline]
+    47 00000493 BA01000000          <1>     mov rdx, 1
+    48 00000498 BF01000000          <1>     mov rdi, 1          ; STDOUT
+    49 0000049D B801000000          <1>     mov rax, 1          ; SYS_WRITE
+    50 000004A2 0F05                <1>     syscall
+    51 000004A4 415F                <1>     pop r15
+    52 000004A6 415E                <1>     pop r14
+    53 000004A8 415D                <1>     pop r13
+    54 000004AA 415C                <1>     pop r12
+    55 000004AC 5B                  <1>     pop rbx
+    56 000004AD C3                  <1>     ret
+    57                              <1> 
+    58                              <1> ; int starts_with_eq(const char *name, const char *env)
+    59                              <1> ;   rdi=name, rsi=env  →  rax=1 if env starts with "name=", else 0
+    60                              <1> starts_with_eq:
+    61 000004AE 31C9                <1>     xor ecx, ecx
+    62                              <1> .l:
+    63 000004B0 8A040F              <1>     mov al, [rdi + rcx]
+    64 000004B3 84C0                <1>     test al, al
+    65 000004B5 740A                <1>     jz .check_eq
+    66 000004B7 3A040E              <1>     cmp al, [rsi + rcx]
+    67 000004BA 7511                <1>     jne .no
+    68 000004BC 48FFC1              <1>     inc rcx
+    69 000004BF EBEF                <1>     jmp .l
+    70                              <1> .check_eq:
+    71 000004C1 803C0E3D            <1>     cmp byte [rsi + rcx], '='
+    72 000004C5 7506                <1>     jne .no
+    73 000004C7 B801000000          <1>     mov eax, 1
+    74 000004CC C3                  <1>     ret
+    75                              <1> .no:
+    76 000004CD 31C0                <1>     xor eax, eax
+    77 000004CF C3                  <1>     ret
+    78                              <1> 
+    79                              <1> ; String constants (guarded for multi-include)
+    80                              <1> %ifndef VIBIX_STR_NEWLINE
+    81                              <1> %define VIBIX_STR_NEWLINE
+    82 000004D0 0A00                <1> str_newline: db 0x0A, 0
+    83                              <1> %endif
+   483                                  %include "vibix_tiny.inc"
+     1                              <1> ; void true_cmd(int argc, const char **argv)
+     2                              <1> ; Exit with code 0 — entry point for direct dispatch.
+     3                              <1> true_cmd:
+     4 000004D2 31FF                <1>     xor edi, edi
+     5 000004D4 B800000000          <1>     mov eax, 0
+     6 000004D9 0F05                <1>     syscall
+     7                              <1> 
+     8                              <1> ; void false_cmd(int argc, const char **argv)
+     9                              <1> ; Exit with code 1 — entry point for direct dispatch.
+    10                              <1> false_cmd:
+    11 000004DB BF01000000          <1>     mov edi, 1
+    12 000004E0 B800000000          <1>     mov eax, 0
+    13 000004E5 0F05                <1>     syscall
+    14                              <1> 
+    15                              <1> ; int true_func(int argc, const char **argv, const char **envp)
+    16                              <1> ; Callable from a shell — returns 0 (does not exit).
+    17                              <1> true_func:
+    18 000004E7 31C0                <1>     xor eax, eax
+    19 000004E9 C3                  <1>     ret
+    20                              <1> 
+    21                              <1> ; int false_func(int argc, const char **argv, const char **envp)
+    22                              <1> ; Callable from a shell — returns 1 (does not exit).
+    23                              <1> false_func:
+    24 000004EA B801000000          <1>     mov eax, 1
+    25 000004EF C3                  <1>     ret
+    26                              <1> 
+    27                              <1> ; void yes_cmd(int argc, const char **argv)
+    28                              <1> ; Repeatedly write "y\n" to stdout until killed.
+    29                              <1> yes_cmd:
+    30 000004F0 53                  <1>     push rbx
+    31 000004F1 4154                <1>     push r12
+    32 000004F3 4C8D2516000000      <1>     lea r12, [rel str_y_newline]
+    33 000004FA BA02000000          <1>     mov rdx, 2                  ; len = 2 ("y\n")
+    34                              <1> .loop:
+    35 000004FF 4C89E6              <1>     mov rsi, r12
+    36 00000502 BF01000000          <1>     mov rdi, 1                  ; STDOUT
+    37 00000507 B801000000          <1>     mov rax, 1                  ; SYS_WRITE
+    38 0000050C 0F05                <1>     syscall
+    39 0000050E EBEF                <1>     jmp .loop
+    40                              <1> 
+    41                              <1> ; String data
+    42 00000510 790A                <1> str_y_newline: db "y", 0x0A
+   484                                  %include "vibix_echo.inc"
+     1                              <1> ;==============================================================================
+     2                              <1> ; vibix_echo.inc — Shared echo implementation for VIBIX flat binaries
+     3                              <1> ;
+     4                              <1> ; Provides: echo(), strlen(), decode_escapes()
+     5                              <1> ;
+     6                              <1> ; Include at the end of your .rodata section:
+     7                              <1> ;   section .rodata
+     8                              <1> ;   %include "vibix_echo.inc"
+     9                              <1> ;==============================================================================
+    10                              <1> 
+    11                              <1> ;==============================================================================
+    12                              <1> ; echo(rdi=argc, rsi=argv[])
+    13                              <1> ;
+    14                              <1> ; Print arguments joined by spaces to stdout, then a newline (unless -n).
+    15                              <1> ; Returns 0 in rax.
+    16                              <1> ;
+    17                              <1> ; Flags -n, -e, -E, -- are consumed from the front of the argument list.
+    18                              <1> ; First non-flag argument ends option processing.
+    19                              <1> ;
+    20                              <1> ; Registers preserved: rbx, r12, r13, r14, r15
+    21                              <1> ; Stack frame: [rsp] = 256-byte decode buffer
+    22                              <1> ;==============================================================================
+    23                              <1> echo:
+    24 00000512 53                  <1>     push rbx
+    25 00000513 4154                <1>     push r12
+    26 00000515 4155                <1>     push r13
+    27 00000517 4156                <1>     push r14
+    28 00000519 4157                <1>     push r15
+    29 0000051B 4881EC00010000      <1>     sub rsp, 256                        ; [rsp] = decode buffer for escapes
+    30                              <1> 
+    31 00000522 4189FC              <1>     mov r12d, edi                       ; r12 = argc
+    32 00000525 4989F5              <1>     mov r13, rsi                        ; r13 = argv
+    33 00000528 4531F6              <1>     xor r14d, r14d                      ; r14 = flags (b0=-n, b1=-e)
+    34 0000052B 41BF01000000        <1>     mov r15d, 1                         ; r15 = 1 (skip argv[0] = command name)
+    35                              <1> 
+    36                              <1> ; ── Option parsing ──────────────────────────────────────────────────────────
+    37                              <1> .opt_loop:
+    38 00000531 4D39E7              <1>     cmp r15, r12
+    39 00000534 7347                <1>     jae .print_args                     ; no args → skip to printing
+    40 00000536 4B8B74FD00          <1>     mov rsi, [r13 + r15*8]              ; rsi = pointer to arg string
+    41 0000053B 803E2D              <1>     cmp byte [rsi], '-'
+    42 0000053E 753D                <1>     jne .print_args                     ; not a flag → done
+    43                              <1> 
+    44                              <1>     ; Check for "--" (end-of-options sentinel)
+    45 00000540 807E012D            <1>     cmp byte [rsi+1], '-'
+    46 00000544 750B                <1>     jne .short_flag
+    47 00000546 807E0200            <1>     cmp byte [rsi+2], 0
+    48 0000054A 7531                <1>     jne .print_args                     ; not exactly "--"
+    49 0000054C 49FFC7              <1>     inc r15                             ; consume "--"
+    50 0000054F EB2C                <1>     jmp .print_args
+    51                              <1> 
+    52                              <1> .short_flag:
+    53 00000551 8A4601              <1>     mov al, [rsi+1]
+    54 00000554 3C6E                <1>     cmp al, 'n'
+    55 00000556 740A                <1>     je .flag_n
+    56 00000558 3C65                <1>     cmp al, 'e'
+    57 0000055A 740F                <1>     je .flag_e
+    58 0000055C 3C45                <1>     cmp al, 'E'
+    59 0000055E 7414                <1>     je .flag_E
+    60 00000560 EB1B                <1>     jmp .print_args                     ; unrecognized flag → stop parsing
+    61                              <1> 
+    62                              <1> .flag_n:
+    63 00000562 4180CE01            <1>     or r14b, 1                          ; set no_newline
+    64 00000566 49FFC7              <1>     inc r15
+    65 00000569 EBC6                <1>     jmp .opt_loop
+    66                              <1> 
+    67                              <1> .flag_e:
+    68 0000056B 4180CE02            <1>     or r14b, 2                          ; set enable_escapes
+    69 0000056F 49FFC7              <1>     inc r15
+    70 00000572 EBBD                <1>     jmp .opt_loop
+    71                              <1> 
+    72                              <1> .flag_E:
+    73 00000574 4180E6FD            <1>     and r14b, 0xFD                      ; clear enable_escapes
+    74 00000578 49FFC7              <1>     inc r15
+    75 0000057B EBB4                <1>     jmp .opt_loop
+    76                              <1> 
+    77                              <1> ; ── Write positional arguments ───────────────────────────────────────────────
+    78                              <1> .print_args:
+    79 0000057D 4D39E7              <1>     cmp r15, r12
+    80 00000580 737D                <1>     jae .maybe_newline                  ; no positional args → just newline
+    81                              <1> 
+    82                              <1> .print_loop:
+    83 00000582 4B8B74FD00          <1>     mov rsi, [r13 + r15*8]              ; rsi = current arg string
+    84                              <1> 
+    85                              <1>     ; Get string length
+    86 00000587 4889F7              <1>     mov rdi, rsi
+    87 0000058A E8E6FEFFFF          <1>     call strlen
+    88 0000058F 4889C3              <1>     mov rbx, rax                        ; rbx = raw string length
+    89                              <1> 
+    90 00000592 41F6C602            <1>     test r14b, 2                        ; enable_escapes set?
+    91 00000596 741A                <1>     jz .write_raw                       ; no → write string as-is
+    92                              <1> 
+    93                              <1>     ; ── Decode escape sequences into stack buffer ─────────────────────────
+    94 00000598 4889F7              <1>     mov rdi, rsi                        ; src = arg string
+    95 0000059B 488D3424            <1>     lea rsi, [rsp]                      ; dst = stack buffer
+    96 0000059F BA00010000          <1>     mov rdx, 256                        ; max output length
+    97 000005A4 E887000000          <1>     call decode_escapes
+    98 000005A9 4889C2              <1>     mov rdx, rax                        ; length for write
+    99 000005AC 488D3424            <1>     lea rsi, [rsp]                      ; buffer for write
+   100 000005B0 EB03                <1>     jmp .write_common
+   101                              <1> 
+   102                              <1> .write_raw:
+   103 000005B2 4889DA              <1>     mov rdx, rbx                        ; length = raw string length
+   104                              <1> 
+   105                              <1> .write_common:
+   106 000005B5 4154                <1>     push r12                            ; argc
+   107 000005B7 4156                <1>     push r14                            ; flags
+   108 000005B9 4157                <1>     push r15                            ; current index
+   109 000005BB 53                  <1>     push rbx                            ; raw string length
+   110                              <1> 
+   111 000005BC BF01000000          <1>     mov rdi, 1                          ; STDOUT
+   112 000005C1 B801000000          <1>     mov rax, 1                          ; SYS_WRITE
+   113 000005C6 0F05                <1>     syscall
+   114                              <1> 
+   115 000005C8 5B                  <1>     pop rbx
+   116 000005C9 415F                <1>     pop r15
+   117 000005CB 415E                <1>     pop r14
+   118 000005CD 415C                <1>     pop r12
+   119                              <1> 
+   120                              <1>     ; Advance to next arg
+   121 000005CF 49FFC7              <1>     inc r15
+   122 000005D2 4D39E7              <1>     cmp r15, r12
+   123 000005D5 7328                <1>     jae .maybe_newline
+   124                              <1> 
+   125                              <1>     ; ── Write space separator between arguments ───────────────────────────
+   126 000005D7 488D3544010000      <1>     lea rsi, [rel str_space]
+   127 000005DE BA01000000          <1>     mov rdx, 1
+   128                              <1> 
+   129 000005E3 4154                <1>     push r12
+   130 000005E5 4156                <1>     push r14
+   131 000005E7 4157                <1>     push r15
+   132 000005E9 53                  <1>     push rbx
+   133                              <1> 
+   134 000005EA BF01000000          <1>     mov rdi, 1                          ; STDOUT
+   135 000005EF B801000000          <1>     mov rax, 1                          ; SYS_WRITE
+   136 000005F4 0F05                <1>     syscall
+   137                              <1> 
+   138 000005F6 5B                  <1>     pop rbx
+   139 000005F7 415F                <1>     pop r15
+   140 000005F9 415E                <1>     pop r14
+   141 000005FB 415C                <1>     pop r12
+   142                              <1> 
+   143 000005FD EB83                <1>     jmp .print_loop
+   144                              <1> 
+   145                              <1> ; ── Newline (unless -n) ──────────────────────────────────────────────────────
+   146                              <1> .maybe_newline:
+   147 000005FF 41F6C601            <1>     test r14b, 1                        ; no_newline set?
+   148 00000603 7518                <1>     jnz .exit_echo
+   149                              <1> 
+   150 00000605 488D35C4FEFFFF      <1>     lea rsi, [rel str_newline]
+   151 0000060C BA01000000          <1>     mov rdx, 1
+   152                              <1> 
+   153 00000611 BF01000000          <1>     mov rdi, 1                          ; STDOUT
+   154 00000616 B801000000          <1>     mov rax, 1                          ; SYS_WRITE
+   155 0000061B 0F05                <1>     syscall
+   156                              <1> 
+   157                              <1> .exit_echo:
+   158 0000061D 31C0                <1>     xor eax, eax                        ; return 0
+   159 0000061F 4881C400010000      <1>     add rsp, 256
+   160 00000626 415F                <1>     pop r15
+   161 00000628 415E                <1>     pop r14
+   162 0000062A 415D                <1>     pop r13
+   163 0000062C 415C                <1>     pop r12
+   164 0000062E 5B                  <1>     pop rbx
+   165 0000062F C3                  <1>     ret
+   166                              <1> 
+   167                              <1> ;==============================================================================
+   168                              <1> ; strlen(rdi = string) → rax = length (excluding null terminator)
+   169                              <1> ;==============================================================================
+   170                              <1> %ifndef VIBIX_STRLEN
+   171                              <1> %define VIBIX_STRLEN
+   172                              <1> strlen:
+   173                              <1>     xor eax, eax
+   174                              <1> .l:
+   175                              <1>     cmp byte [rdi + rax], 0
+   176                              <1>     je .d
+   177                              <1>     inc rax
+   178                              <1>     jmp .l
+   179                              <1> .d:
+   180                              <1>     ret
+   181                              <1> %endif
+   182                              <1> ;==============================================================================
+   183                              <1> ; decode_escapes(rdi = src, rsi = dst, rdx = max_len) → rax = decoded length
+   184                              <1> ;
+   185                              <1> ; Decode escape sequences from null-terminated src into dst buffer:
+   186                              <1> ;   \n → 0x0A    \t → 0x09    \r → 0x0D    \\ → 0x5C
+   187                              <1> ;   \0[NNN] → byte with octal value (0-3 octal digits, default 0)
+   188                              <1> ;   \<unknown> → literal backslash followed by the character
+   189                              <1> ;==============================================================================
+   190                              <1> decode_escapes:
+   191 00000630 53                  <1>     push rbx
+   192 00000631 4154                <1>     push r12
+   193                              <1> 
+   194 00000633 4989F8              <1>     mov r8, rdi                         ; r8 = src pointer
+   195 00000636 4989F1              <1>     mov r9, rsi                         ; r9 = dst pointer
+   196 00000639 4989D2              <1>     mov r10, rdx                        ; r10 = max output length
+   197 0000063C 4531DB              <1>     xor r11d, r11d                      ; r11 = decoded byte count
+   198                              <1> 
+   199                              <1> .loop:
+   200 0000063F 4D39D3              <1>     cmp r11, r10
+   201 00000642 0F83D3000000        <1>     jae .done
+   202 00000648 418A00              <1>     mov al, [r8]
+   203 0000064B 84C0                <1>     test al, al
+   204 0000064D 0F84C8000000        <1>     jz .done
+   205                              <1> 
+   206 00000653 3C5C                <1>     cmp al, 0x5C                        ; backslash?
+   207 00000655 0F85B1000000        <1>     jne .copy_char
+   208                              <1> 
+   209 0000065B 49FFC0              <1>     inc r8                              ; consume backslash
+   210 0000065E 418A00              <1>     mov al, [r8]
+   211 00000661 84C0                <1>     test al, al
+   212 00000663 7468                <1>     jz .lone_backslash
+   213                              <1> 
+   214 00000665 3C6E                <1>     cmp al, 'n'
+   215 00000667 742D                <1>     je .esc_nl
+   216 00000669 3C74                <1>     cmp al, 't'
+   217 0000066B 7436                <1>     je .esc_tab
+   218 0000066D 3C72                <1>     cmp al, 'r'
+   219 0000066F 743F                <1>     je .esc_cr
+   220 00000671 3C5C                <1>     cmp al, 0x5C
+   221 00000673 7448                <1>     je .esc_bs
+   222 00000675 3C30                <1>     cmp al, '0'
+   223 00000677 7464                <1>     je .esc_octal
+   224                              <1> 
+   225                              <1>     ; Unknown escape — output backslash then char literally
+   226 00000679 43C604195C          <1>     mov byte [r9 + r11], 0x5C
+   227 0000067E 49FFC3              <1>     inc r11
+   228 00000681 4D39D3              <1>     cmp r11, r10
+   229 00000684 0F8391000000        <1>     jae .done
+   230 0000068A 43880419            <1>     mov byte [r9 + r11], al
+   231 0000068E 49FFC3              <1>     inc r11
+   232 00000691 49FFC0              <1>     inc r8
+   233 00000694 EBA9                <1>     jmp .loop
+   234                              <1> 
+   235                              <1> .esc_nl:
+   236 00000696 43C604190A          <1>     mov byte [r9 + r11], 0x0A
+   237 0000069B 49FFC3              <1>     inc r11
+   238 0000069E 49FFC0              <1>     inc r8
+   239 000006A1 EB9C                <1>     jmp .loop
+   240                              <1> 
+   241                              <1> .esc_tab:
+   242 000006A3 43C6041909          <1>     mov byte [r9 + r11], 0x09
+   243 000006A8 49FFC3              <1>     inc r11
+   244 000006AB 49FFC0              <1>     inc r8
+   245 000006AE EB8F                <1>     jmp .loop
+   246                              <1> 
+   247                              <1> .esc_cr:
+   248 000006B0 43C604190D          <1>     mov byte [r9 + r11], 0x0D
+   249 000006B5 49FFC3              <1>     inc r11
+   250 000006B8 49FFC0              <1>     inc r8
+   251 000006BB EB82                <1>     jmp .loop
+   252                              <1> 
+   253                              <1> .esc_bs:
+   254 000006BD 43C604195C          <1>     mov byte [r9 + r11], 0x5C
+   255 000006C2 49FFC3              <1>     inc r11
+   256 000006C5 49FFC0              <1>     inc r8
+   257 000006C8 E972FFFFFF          <1>     jmp .loop
+   258                              <1> 
+   259                              <1> .lone_backslash:
+   260 000006CD 43C604195C          <1>     mov byte [r9 + r11], 0x5C
+   261 000006D2 49FFC3              <1>     inc r11
+   262 000006D5 49FFC0              <1>     inc r8
+   263 000006D8 E962FFFFFF          <1>     jmp .loop
+   264                              <1> 
+   265                              <1> ; ── Octal escape \0NNN ──────────────────────────────────────────────────────
+   266                              <1> .esc_octal:
+   267 000006DD 49FFC0              <1>     inc r8                              ; past '0'
+   268 000006E0 31DB                <1>     xor ebx, ebx
+   269 000006E2 41BC03000000        <1>     mov r12d, 3                         ; max 3 octal digits
+   270                              <1> 
+   271                              <1> .octal_try:
+   272 000006E8 418A00              <1>     mov al, [r8]
+   273 000006EB 2C30                <1>     sub al, '0'
+   274 000006ED 7211                <1>     jb .octal_write
+   275 000006EF 3C07                <1>     cmp al, 7
+   276 000006F1 770D                <1>     ja .octal_write
+   277 000006F3 C1E303              <1>     shl ebx, 3
+   278 000006F6 01C3                <1>     add ebx, eax
+   279 000006F8 49FFC0              <1>     inc r8
+   280 000006FB 41FFCC              <1>     dec r12d
+   281 000006FE 75E8                <1>     jnz .octal_try
+   282                              <1> 
+   283                              <1> .octal_write:
+   284 00000700 43881C19            <1>     mov [r9 + r11], bl
+   285 00000704 49FFC3              <1>     inc r11
+   286 00000707 E933FFFFFF          <1>     jmp .loop
+   287                              <1> 
+   288                              <1> .copy_char:
+   289 0000070C 43880419            <1>     mov [r9 + r11], al
+   290 00000710 49FFC3              <1>     inc r11
+   291 00000713 49FFC0              <1>     inc r8
+   292 00000716 E924FFFFFF          <1>     jmp .loop
+   293                              <1> 
+   294                              <1> .done:
+   295 0000071B 4C89D8              <1>     mov rax, r11
+   296 0000071E 415C                <1>     pop r12
+   297 00000720 5B                  <1>     pop rbx
+   298 00000721 C3                  <1>     ret
+   299                              <1> 
+   300                              <1> ; ── String constants (guarded for multi-include) ──────────────────────────────
+   301                              <1> %ifndef VIBIX_STR_SPACE
+   302                              <1> %define VIBIX_STR_SPACE
+   303 00000722 2000                <1> str_space:   db " ", 0
+   304                              <1> %endif
+   305                              <1> %ifndef VIBIX_STR_NEWLINE
+   306                              <1> %define VIBIX_STR_NEWLINE
+   307                              <1> str_newline: db 0x0A, 0
+   308                              <1> %endif
+   485                                  %include "vibix_cat.inc"
+     1                              <1> ; void cat(int argc, const char **argv)
+     2                              <1> ; Reads from stdin (fd=0) in 256-byte chunks, writes to stdout (fd=1).
+     3                              <1> ; Takes argc/argv for interface consistency (ignores them — VIBIX has no open()).
+     4                              <1> cat:
+     5 00000724 53                  <1>     push rbx
+     6 00000725 4154                <1>     push r12
+     7 00000727 4881EC00010000      <1>     sub rsp, 256                ; 256-byte read buffer on stack
+     8 0000072E 4989E4              <1>     mov r12, rsp                ; r12 = buffer pointer
+     9                              <1> 
+    10                              <1> .loop:
+    11 00000731 B802000000          <1>     mov rax, 2                  ; SYS_READ
+    12 00000736 4831FF              <1>     xor rdi, rdi                ; fd = 0 (stdin)
+    13 00000739 4C89E6              <1>     mov rsi, r12                ; buf
+    14 0000073C BA00010000          <1>     mov rdx, 256                ; len
+    15 00000741 0F05                <1>     syscall
+    16                              <1> 
+    17 00000743 4885C0              <1>     test rax, rax
+    18 00000746 7E14                <1>     jle .done                   ; EOF or error
+    19                              <1> 
+    20 00000748 4889C2              <1>     mov rdx, rax                ; bytes read → write length
+    21 0000074B B801000000          <1>     mov rax, 1                  ; SYS_WRITE
+    22 00000750 BF01000000          <1>     mov rdi, 1                  ; fd = 1 (stdout)
+    23 00000755 4C89E6              <1>     mov rsi, r12                ; buf
+    24 00000758 0F05                <1>     syscall
+    25                              <1> 
+    26 0000075A EBD5                <1>     jmp .loop
+    27                              <1> 
+    28                              <1> .done:
+    29 0000075C 4881C400010000      <1>     add rsp, 256
+    30 00000763 415C                <1>     pop r12
+    31 00000765 5B                  <1>     pop rbx
+    32 00000766 C3                  <1>     ret
+   486                                  %include "vibix_printenv.inc"
+     1                              <1> ; void printenv(int argc, const char **argv, const char **envp)
+     2                              <1> ;
+     3                              <1> ; Print all or selected environment variables.
+     4                              <1> ;   argc=1 → print all env vars (NAME=value, one per line)
+     5                              <1> ;   argc>1 → print only vars matching argv[1..argc-1]
+     6                              <1> ;
+     7                              <1> ; envp is a null-terminated array of "NAME=value" strings.
+     8                              <1> printenv:
+     9 00000767 53                  <1>     push rbx
+    10 00000768 4154                <1>     push r12
+    11 0000076A 4155                <1>     push r13
+    12 0000076C 4156                <1>     push r14
+    13 0000076E 4157                <1>     push r15
+    14                              <1> 
+    15 00000770 4989FC              <1>     mov r12, rdi                ; r12 = argc
+    16 00000773 4989F5              <1>     mov r13, rsi                ; r13 = argv
+    17 00000776 4989D6              <1>     mov r14, rdx                ; r14 = envp
+    18                              <1> 
+    19 00000779 4983FC01            <1>     cmp r12, 1
+    20 0000077D 7F20                <1>     jg .filter                  ; argc > 1 → filter mode
+    21                              <1> 
+    22                              <1>     ; ── Print-all mode ────────────────────────────────────────────────────
+    23                              <1> .print_all:
+    24 0000077F 4D89F7              <1>     mov r15, r14                ; r15 = current envp entry
+    25                              <1> .loop_all:
+    26 00000782 498B37              <1>     mov rsi, [r15]
+    27 00000785 4885F6              <1>     test rsi, rsi
+    28 00000788 745B                <1>     jz .done
+    29 0000078A BF01000000          <1>     mov rdi, 1
+    30 0000078F E8B8FCFFFF          <1>     call write_str
+    31 00000794 E8EAFCFFFF          <1>     call write_newline
+    32 00000799 4983C708            <1>     add r15, 8
+    33 0000079D EBE3                <1>     jmp .loop_all
+    34                              <1> 
+    35                              <1>     ; ── Filter mode ────────────────────────────────────────────────────────
+    36                              <1> .filter:
+    37 0000079F 4D89F7              <1>     mov r15, r14                ; r15 = envp cursor
+    38                              <1> .filter_env_loop:
+    39 000007A2 498B37              <1>     mov rsi, [r15]
+    40 000007A5 4885F6              <1>     test rsi, rsi
+    41 000007A8 743B                <1>     jz .done
+    42                              <1> 
+    43 000007AA BB01000000          <1>     mov rbx, 1                  ; start from argv[1]
+    44                              <1> .filter_arg_loop:
+    45 000007AF 4C39E3              <1>     cmp rbx, r12
+    46 000007B2 7D2B                <1>     jge .filter_next_env
+    47                              <1> 
+    48 000007B4 498B7CDD00          <1>     mov rdi, [r13 + rbx*8]      ; rdi = arg name
+    49 000007B9 498B37              <1>     mov rsi, [r15]              ; rsi = env string (reload)
+    50 000007BC E8EDFCFFFF          <1>     call starts_with_eq
+    51 000007C1 4885C0              <1>     test rax, rax
+    52 000007C4 7414                <1>     jz .filter_next_arg
+    53                              <1> 
+    54                              <1>     ; Match found — print env line
+    55 000007C6 498B37              <1>     mov rsi, [r15]
+    56 000007C9 BF01000000          <1>     mov rdi, 1
+    57 000007CE E879FCFFFF          <1>     call write_str
+    58 000007D3 E8ABFCFFFF          <1>     call write_newline
+    59 000007D8 EB05                <1>     jmp .filter_next_env
+    60                              <1> 
+    61                              <1> .filter_next_arg:
+    62 000007DA 48FFC3              <1>     inc rbx
+    63 000007DD EBD0                <1>     jmp .filter_arg_loop
+    64                              <1> 
+    65                              <1> .filter_next_env:
+    66 000007DF 4983C708            <1>     add r15, 8
+    67 000007E3 EBBD                <1>     jmp .filter_env_loop
+    68                              <1> 
+    69                              <1> .done:
+    70 000007E5 415F                <1>     pop r15
+    71 000007E7 415E                <1>     pop r14
+    72 000007E9 415D                <1>     pop r13
+    73 000007EB 415C                <1>     pop r12
+    74 000007ED 5B                  <1>     pop rbx
+    75 000007EE C3                  <1>     ret
+   487                                  %include "vibix_clear.inc"
+     1                              <1> ; void clear_cmd(int argc, const char **argv)
+     2                              <1> ; Clear the terminal using ANSI escape codes: ESC[2J + ESC[H
+     3                              <1> clear_cmd:
+     4 000007EF 53                  <1>     push rbx
+     5 000007F0 4154                <1>     push r12
+     6 000007F2 4155                <1>     push r13
+     7                              <1> 
+     8 000007F4 4C8D2535000000      <1>     lea r12, [rel clear_seq]
+     9 000007FB BA04000000          <1>     mov rdx, 4                  ; len = ESC[2J (4 bytes)
+    10 00000800 4C89E6              <1>     mov rsi, r12
+    11 00000803 BF01000000          <1>     mov rdi, 1                  ; STDOUT
+    12 00000808 B801000000          <1>     mov rax, 1                  ; SYS_WRITE
+    13 0000080D 0F05                <1>     syscall
+    14                              <1> 
+    15 0000080F 4C8D2D1E000000      <1>     lea r13, [rel home_seq]
+    16 00000816 BA03000000          <1>     mov rdx, 3                  ; len = ESC[H (3 bytes)
+    17 0000081B 4C89EE              <1>     mov rsi, r13
+    18 0000081E BF01000000          <1>     mov rdi, 1
+    19 00000823 B801000000          <1>     mov rax, 1
+    20 00000828 0F05                <1>     syscall
+    21                              <1> 
+    22 0000082A 415D                <1>     pop r13
+    23 0000082C 415C                <1>     pop r12
+    24 0000082E 5B                  <1>     pop rbx
+    25 0000082F C3                  <1>     ret
+    26                              <1> 
+    27                              <1> ; String data
+    28 00000830 1B5B324A            <1> clear_seq: db 0x1B, "[2J"
+    29 00000834 1B5B48              <1> home_seq:  db 0x1B, "[H"
+   488                                  %include "vibix_shell.inc"
+     1                              <1> ;==============================================================================
+     2                              <1> ; vibix_shell.inc — Interactive serial shell for VIBIX
+     3                              <1> ;
+     4                              <1> ; Provides: shell() — main entry point (read-eval-print loop)
+     5                              <1> ;
+     6                              <1> ; Depends on: vibix_core.inc (write_str, strlen, write_newline)
+     7                              <1> ;
+     8                              <1> ; Features:
+     9                              <1> ;   - Readline with backspace editing
+    10                              <1> ;   - Command history (4 entries, up/down arrow navigation)
+    11                              <1> ;   - Command table dispatch (echo, cat, printenv, clear, true, false)
+    12                              <1> ;   - Builtins: exit, help, history, clear, poweroff, reboot
+    13                              <1> ;   - Error messages for unknown commands
+    14                              <1> ;
+    15                              <1> ; Include AFTER all other inc files so command labels are visible.
+    16                              <1> ;==============================================================================
+    17                              <1> 
+    18                              <1> ; ── Configuration ─────────────────────────────────────────────────────────────
+    19                              <1> HISTORY_DEPTH   equ 4           ; number of remembered commands
+    20                              <1> LINE_MAX        equ 256         ; max input line length
+    21                              <1> MAX_ARGS        equ 16          ; max args per command
+    22                              <1> %define PROMPT_STR "vibix$ "     ; shell prompt (text macro, used in db below)
+    23                              <1> 
+    24                              <1> ; ── Main shell entry point ───────────────────────────────────────────────────
+    25                              <1> ; Called from dispatch table. Never returns (loops until 'exit' builtin).
+    26                              <1> ; Input: rdi = argc, rsi = argv, rdx = envp
+    27                              <1> shell:
+    28                              <1>     ; Reset stack to top of user stack page
+    29 00000837 BC00300002          <1>     mov rsp, 0x2003000
+    30                              <1> 
+    31 0000083C 53                  <1>     push rbx
+    32 0000083D 4154                <1>     push r12
+    33 0000083F 4155                <1>     push r13
+    34 00000841 4156                <1>     push r14
+    35 00000843 4157                <1>     push r15
+    36                              <1> 
+    37                              <1>     ; Save envp for printenv builtin
+    38 00000845 4989D7              <1>     mov r15, rdx                    ; r15 = envp (may be NULL)
+    39                              <1> 
+    40                              <1>     ; Zero-initialize history
+    41 00000848 31C0                <1>     xor eax, eax
+    42 0000084A 488D3D470B0000      <1>     lea rdi, [rel history_buf]
+    43 00000851 B900040000          <1>     mov ecx, HISTORY_DEPTH * LINE_MAX
+    44 00000856 F3AA                <1>     rep stosb
+    45                              <1> 
+    46                              <1>     ; Initialize history count
+    47 00000858 48C705350F00000000- <1>     mov qword [rel history_count], 0
+    47 00000861 0000                <1>
+    48 00000863 48C705320F00000000- <1>     mov qword [rel history_index], 0
+    48 0000086C 0000                <1>
+    49                              <1> 
+    50                              <1>     ; ── Welcome banner ──────────────────────────────────────────────────────
+    51 0000086E 488D359E060000      <1>     lea rsi, [rel str_welcome]
+    52 00000875 BF01000000          <1>     mov rdi, 1
+    53 0000087A E8CDFBFFFF          <1>     call write_str
+    54 0000087F E8FFFBFFFF          <1>     call write_newline
+    55 00000884 E8FAFBFFFF          <1>     call write_newline
+    56                              <1> 
+    57                              <1> ; ── Main read-eval-print loop ────────────────────────────────────────────────
+    58                              <1> .shell_loop:
+    59                              <1>     ; Print prompt: "vibix$ "
+    60 00000889 488D357B060000      <1>     lea rsi, [rel str_prompt]
+    61 00000890 BF01000000          <1>     mov rdi, 1
+    62 00000895 E8B2FBFFFF          <1>     call write_str
+    63                              <1> 
+    64                              <1>     ; ── Read a line with editing and history ────────────────────────────────
+    65 0000089A 488D3D77090000      <1>     lea rdi, [rel input_line]
+    66 000008A1 BE00010000          <1>     mov esi, LINE_MAX
+    67 000008A6 E8DB010000          <1>     call readline
+    68 000008AB 4989C4              <1>     mov r12, rax                    ; r12 = line length
+    69                              <1> 
+    70                              <1>     ; Empty line → reprompt
+    71 000008AE 4D85E4              <1>     test r12, r12
+    72 000008B1 74D6                <1>     jz .shell_loop
+    73                              <1> 
+    74                              <1>     ; Null-terminate the line
+    75 000008B3 488D1D5E090000      <1>     lea rbx, [rel input_line]
+    76 000008BA 42C6042300          <1>     mov byte [rbx + r12], 0
+    77                              <1> 
+    78                              <1>     ; Strip trailing newline/cr if present
+    79 000008BF 49FFCC              <1>     dec r12
+    80 000008C2 428A0423            <1>     mov al, [rbx + r12]
+    81 000008C6 3C0A                <1>     cmp al, 0x0A
+    82 000008C8 7409                <1>     je .strip_nl
+    83 000008CA 3C0D                <1>     cmp al, 0x0D
+    84 000008CC 7405                <1>     je .strip_cr
+    85 000008CE 49FFC4              <1>     inc r12                         ; not a newline, restore
+    86 000008D1 EB05                <1>     jmp .parsing
+    87                              <1> 
+    88                              <1> .strip_nl:
+    89                              <1> .strip_cr:
+    90 000008D3 42C6042300          <1>     mov byte [rbx + r12], 0
+    91                              <1> 
+    92                              <1> .parsing:
+    93                              <1>     ; ── Parse line into command + args ──────────────────────────────────────
+    94                              <1>     ; rbx = input_line, r12 = length (adjusted)
+    95 000008D8 488D3D39090000      <1>     lea rdi, [rel input_line]
+    96 000008DF 488D35320A0000      <1>     lea rsi, [rel argv_buf]
+    97 000008E6 B910000000          <1>     mov ecx, MAX_ARGS
+    98 000008EB E809050000          <1>     call parse_line
+    99 000008F0 4989C5              <1>     mov r13, rax                    ; r13 = argc
+   100                              <1> 
+   101 000008F3 4D85ED              <1>     test r13, r13
+   102 000008F6 7491                <1>     jz .shell_loop                  ; no command → reprompt
+   103                              <1> 
+   104                              <1>     ; ── Check builtins ──────────────────────────────────────────────────────
+   105 000008F8 488B3D190A0000      <1>     mov rdi, [rel argv_buf]         ; rdi = command name
+   106                              <1> 
+   107                              <1>     ; "exit" builtin
+   108 000008FF 488D3533060000      <1>     lea rsi, [rel str_exit]
+   109 00000906 E8D3050000          <1>     call strcmp
+   110 0000090B 4885C0              <1>     test rax, rax
+   111 0000090E 7505                <1>     jnz .check_help
+   112 00000910 E952010000          <1>     jmp .exit_shell
+   113                              <1> 
+   114                              <1> .check_help:
+   115 00000915 488D3522060000      <1>     lea rsi, [rel str_help]
+   116 0000091C E8BD050000          <1>     call strcmp
+   117 00000921 4885C0              <1>     test rax, rax
+   118 00000924 750A                <1>     jnz .check_history
+   119 00000926 E88F050000          <1>     call shell_help
+   120 0000092B E959FFFFFF          <1>     jmp .shell_loop
+   121                              <1> 
+   122                              <1> .check_history:
+   123 00000930 488D350C060000      <1>     lea rsi, [rel str_history_cmd]
+   124 00000937 E8A2050000          <1>     call strcmp
+   125 0000093C 4885C0              <1>     test rax, rax
+   126 0000093F 750A                <1>     jnz .check_clear
+   127 00000941 E88C050000          <1>     call shell_history
+   128 00000946 E93EFFFFFF          <1>     jmp .shell_loop
+   129                              <1> 
+   130                              <1> .check_clear:
+   131 0000094B 488D35F9050000      <1>     lea rsi, [rel str_clear]
+   132 00000952 E887050000          <1>     call strcmp
+   133 00000957 4885C0              <1>     test rax, rax
+   134 0000095A 7516                <1>     jnz .check_poweroff
+   135                              <1>     ; "clear" — just run clear_cmd
+   136 0000095C BF01000000          <1>     mov rdi, 1
+   137 00000961 488D35B0090000      <1>     lea rsi, [rel argv_buf]
+   138 00000968 E882FEFFFF          <1>     call clear_cmd
+   139 0000096D E917FFFFFF          <1>     jmp .shell_loop
+   140                              <1> 
+   141                              <1> ; ── Poweroff/reboot builtins (VIBIT shutdown IPC) ─────────────────────────
+   142                              <1> ; These set the shared-memory shutdown_flag and then exit.
+   143                              <1> ; PID 1 (init) checks shutdown_flag in reaper loop → calls poweroff/reboot.
+   144                              <1> .check_poweroff:
+   145 00000972 488D35D8050000      <1>     lea rsi, [rel str_poweroff_cmd]
+   146 00000979 E860050000          <1>     call strcmp
+   147 0000097E 4885C0              <1>     test rax, rax
+   148 00000981 7525                <1>     jnz .check_reboot
+   149 00000983 C705B7FAFFFF020000- <1>     mov dword [rel shutdown_flag], SHUTDOWN_POWEROFF
+   149 0000098C 00                  <1>
+   150 0000098D 488D35CD050000      <1>     lea rsi, [rel str_poweroff_msg]
+   151 00000994 BF01000000          <1>     mov rdi, 1
+   152 00000999 E8AEFAFFFF          <1>     call write_str
+   153 0000099E E8E0FAFFFF          <1>     call write_newline
+   154 000009A3 E9BF000000          <1>     jmp .exit_shell
+   155                              <1> 
+   156                              <1> .check_reboot:
+   157 000009A8 488D35AB050000      <1>     lea rsi, [rel str_reboot_cmd]
+   158 000009AF E82A050000          <1>     call strcmp
+   159 000009B4 4885C0              <1>     test rax, rax
+   160 000009B7 7525                <1>     jnz .check_empty
+   161 000009B9 C70581FAFFFF010000- <1>     mov dword [rel shutdown_flag], SHUTDOWN_REBOOT
+   161 000009C2 00                  <1>
+   162 000009C3 488D35B1050000      <1>     lea rsi, [rel str_reboot_msg]
+   163 000009CA BF01000000          <1>     mov rdi, 1
+   164 000009CF E878FAFFFF          <1>     call write_str
+   165 000009D4 E8AAFAFFFF          <1>     call write_newline
+   166 000009D9 E989000000          <1>     jmp .exit_shell
+   167                              <1> 
+   168                              <1> .check_empty:
+   169                              <1>     ; Empty command name (shouldn't happen)
+   170 000009DE 803F00              <1>     cmp byte [rdi], 0
+   171 000009E1 0F84A2FEFFFF        <1>     je .shell_loop
+   172                              <1> 
+   173                              <1>     ; ── Lookup in command table ─────────────────────────────────────────────
+   174 000009E7 4C8D35A1070000      <1>     lea r14, [rel cmd_table]        ; r14 = cmd table pointer
+   175 000009EE 4531E4              <1>     xor r12d, r12d                  ; r12 = command index
+   176                              <1> 
+   177                              <1> .find_loop:
+   178 000009F1 498B36              <1>     mov rsi, [r14]                  ; rsi = table entry name pointer
+   179 000009F4 4885F6              <1>     test rsi, rsi
+   180 000009F7 7431                <1>     jz .not_found                   ; NULL → end of table
+   181                              <1> 
+   182 000009F9 57                  <1>     push rdi                        ; save command name
+   183 000009FA 56                  <1>     push rsi                        ; save table entry name
+   184 000009FB E8DE040000          <1>     call strcmp
+   185 00000A00 5E                  <1>     pop rsi
+   186 00000A01 5F                  <1>     pop rdi
+   187 00000A02 4885C0              <1>     test rax, rax
+   188 00000A05 751A                <1>     jnz .next_entry
+   189                              <1> 
+   190                              <1>     ; Match found — call the function
+   191 00000A07 498B4608            <1>     mov rax, [r14 + 8]              ; rax = function pointer
+   192 00000A0B 4C89EF              <1>     mov rdi, r13                    ; rdi = argc
+   193 00000A0E 488D3503090000      <1>     lea rsi, [rel argv_buf]         ; rsi = argv
+   194 00000A15 31D2                <1>     xor edx, edx                    ; rdx = 0 (envp placeholder)
+   195 00000A17 4C89FA              <1>     mov rdx, r15                    ; rdx = envp (for printenv)
+   196 00000A1A FFD0                <1>     call rax
+   197 00000A1C E968FEFFFF          <1>     jmp .shell_loop
+   198                              <1> 
+   199                              <1> .next_entry:
+   200 00000A21 4983C610            <1>     add r14, 16
+   201 00000A25 41FFC4              <1>     inc r12d
+   202 00000A28 EBC7                <1>     jmp .find_loop
+   203                              <1> 
+   204                              <1> .not_found:
+   205                              <1>     ; Print "command not found" message
+   206 00000A2A 488D3562050000      <1>     lea rsi, [rel str_not_found_1]
+   207 00000A31 BF01000000          <1>     mov rdi, 1
+   208 00000A36 E811FAFFFF          <1>     call write_str
+   209 00000A3B 488B35D6080000      <1>     mov rsi, [rel argv_buf]
+   210 00000A42 BF01000000          <1>     mov rdi, 1
+   211 00000A47 E800FAFFFF          <1>     call write_str
+   212 00000A4C 488D3548050000      <1>     lea rsi, [rel str_not_found_2]
+   213 00000A53 BF01000000          <1>     mov rdi, 1
+   214 00000A58 E8EFF9FFFF          <1>     call write_str
+   215 00000A5D E821FAFFFF          <1>     call write_newline
+   216 00000A62 E922FEFFFF          <1>     jmp .shell_loop
+   217                              <1> 
+   218                              <1> ; ── Exit builtin ─────────────────────────────────────────────────────────────
+   219                              <1> .exit_shell:
+   220 00000A67 488D35C2040000      <1>     lea rsi, [rel str_bye]
+   221 00000A6E BF01000000          <1>     mov rdi, 1
+   222 00000A73 E8D4F9FFFF          <1>     call write_str
+   223 00000A78 E806FAFFFF          <1>     call write_newline
+   224 00000A7D 31FF                <1>     xor edi, edi
+   225 00000A7F B800000000          <1>     mov eax, 0                          ; SYS_EXIT
+   226 00000A84 0F05                <1>     syscall
+   227                              <1> 
+   228                              <1> ;==============================================================================
+   229                              <1> ; readline(buf, max_len) — Read line with editing and history
+   230                              <1> ;
+   231                              <1> ; Input:  rdi = buffer address, esi = max length
+   232                              <1> ; Output: rax = line length (0 for empty/EOF)
+   233                              <1> ;
+   234                              <1> ; Features:
+   235                              <1> ;   - Echoes printable characters
+   236                              <1> ;   - Backspace (0x7F or 0x08) deletes last character
+   237                              <1> ;   - Ctrl+D on empty line → exit shell
+   238                              <1> ;   - Up arrow (ESC [ A) / Down arrow (ESC [ B) for history
+   239                              <1> ;   - Enter (0x0D) submits line
+   240                              <1> ;==============================================================================
+   241                              <1> readline:
+   242 00000A86 53                  <1>     push rbx
+   243 00000A87 4154                <1>     push r12
+   244 00000A89 4155                <1>     push r13
+   245 00000A8B 4156                <1>     push r14
+   246 00000A8D 4157                <1>     push r15
+   247                              <1> 
+   248 00000A8F 4989FC              <1>     mov r12, rdi                    ; r12 = buffer
+   249 00000A92 4189F5              <1>     mov r13d, esi                   ; r13 = max length
+   250 00000A95 4531F6              <1>     xor r14d, r14d                  ; r14 = current position (offset in buf)
+   251                              <1> 
+   252                              <1>     ; Reset history browse position to end
+   253 00000A98 4C8B3DF90C0000      <1>     mov r15, [rel history_count]    ; r15 = history browse index
+   254                              <1> 
+   255                              <1> .readline_loop:
+   256                              <1>     ; Read one byte from stdin
+   257 00000A9F 4883EC10            <1>     sub rsp, 16
+   258 00000AA3 BF00000000          <1>     mov rdi, 0                      ; fd = stdin
+   259 00000AA8 4889E6              <1>     mov rsi, rsp                    ; buffer on stack
+   260 00000AAB BA01000000          <1>     mov rdx, 1                      ; 1 byte
+   261 00000AB0 B802000000          <1>     mov rax, 2                      ; SYS_READ
+   262 00000AB5 0F05                <1>     syscall
+   263 00000AB7 4883C410            <1>     add rsp, 16
+   264                              <1> 
+   265 00000ABB 4885C0              <1>     test rax, rax
+   266 00000ABE 0F8E95010000        <1>     jle .eof                        ; EOF or error → end of input
+   267                              <1> 
+   268 00000AC4 8A4424F0            <1>     mov al, [rsp - 16]              ; reload the byte we read
+   269                              <1> 
+   270                              <1>     ; ── Handle Enter (0x0D) ────────────────────────────────────────────────
+   271 00000AC8 3C0D                <1>     cmp al, 0x0D
+   272 00000ACA 0F8419010000        <1>     je .enter
+   273                              <1> 
+   274                              <1>     ; ── Handle Ctrl+D ───────────────────────────────────────────────────────
+   275 00000AD0 3C04                <1>     cmp al, 0x04
+   276 00000AD2 0F8452010000        <1>     je .ctrl_d
+   277                              <1> 
+   278                              <1>     ; ── Handle Backspace (0x7F or 0x08) ────────────────────────────────────
+   279 00000AD8 3C7F                <1>     cmp al, 0x7F
+   280 00000ADA 7434                <1>     je .backspace
+   281 00000ADC 3C08                <1>     cmp al, 0x08
+   282 00000ADE 7430                <1>     je .backspace
+   283                              <1> 
+   284                              <1>     ; ── Handle Escape sequences (arrow keys) ────────────────────────────────
+   285 00000AE0 3C1B                <1>     cmp al, 0x1B
+   286 00000AE2 746B                <1>     je .escape_seq
+   287                              <1> 
+   288                              <1>     ; ── Handle regular printable characters ─────────────────────────────────
+   289 00000AE4 3C20                <1>     cmp al, 0x20                    ; space
+   290 00000AE6 72B7                <1>     jb .readline_loop               ; ignore other control chars
+   291 00000AE8 3C7E                <1>     cmp al, 0x7E                    ; DEL (handled above) and beyond
+   292 00000AEA 77B3                <1>     ja .readline_loop
+   293                              <1> 
+   294                              <1>     ; Check if buffer is full
+   295 00000AEC 4539EE              <1>     cmp r14d, r13d
+   296 00000AEF 73AE                <1>     jae .readline_loop
+   297                              <1> 
+   298                              <1>     ; Store character
+   299 00000AF1 43880434            <1>     mov [r12 + r14], al
+   300 00000AF5 41FFC6              <1>     inc r14d
+   301                              <1> 
+   302                              <1>     ; Echo character back
+   303 00000AF8 50                  <1>     push rax
+   304 00000AF9 BF01000000          <1>     mov rdi, 1                      ; STDOUT
+   305 00000AFE 4889E6              <1>     mov rsi, rsp                    ; byte on stack
+   306 00000B01 BA01000000          <1>     mov rdx, 1
+   307 00000B06 B801000000          <1>     mov rax, 1                      ; SYS_WRITE
+   308 00000B0B 0F05                <1>     syscall
+   309 00000B0D 58                  <1>     pop rax
+   310                              <1> 
+   311 00000B0E EB8F                <1>     jmp .readline_loop
+   312                              <1> 
+   313                              <1> .backspace:
+   314 00000B10 4585F6              <1>     test r14d, r14d
+   315 00000B13 748A                <1>     jz .readline_loop               ; nothing to delete
+   316                              <1> 
+   317 00000B15 41FFCE              <1>     dec r14d                        ; move position back
+   318                              <1> 
+   319                              <1>     ; Send backspace: move left, overwrite with space, move left again
+   320                              <1>     ; Sequence: 0x08 ' ' 0x08
+   321 00000B18 50                  <1>     push rax
+   322 00000B19 53                  <1>     push rbx
+   323 00000B1A C6042408            <1>     mov byte [rsp], 0x08
+   324 00000B1E BF01000000          <1>     mov rdi, 1
+   325 00000B23 4889E6              <1>     mov rsi, rsp
+   326 00000B26 BA01000000          <1>     mov rdx, 1
+   327 00000B2B B801000000          <1>     mov rax, 1                      ; SYS_WRITE
+   328 00000B30 0F05                <1>     syscall
+   329                              <1> 
+   330 00000B32 C6042420            <1>     mov byte [rsp], 0x20            ; space
+   331 00000B36 B801000000          <1>     mov rax, 1
+   332 00000B3B 0F05                <1>     syscall
+   333                              <1> 
+   334 00000B3D C6042408            <1>     mov byte [rsp], 0x08            ; backspace again
+   335 00000B41 B801000000          <1>     mov rax, 1
+   336 00000B46 0F05                <1>     syscall
+   337 00000B48 5B                  <1>     pop rbx
+   338 00000B49 58                  <1>     pop rax
+   339                              <1> 
+   340 00000B4A E950FFFFFF          <1>     jmp .readline_loop
+   341                              <1> 
+   342                              <1> .escape_seq:
+   343                              <1>     ; Read next two bytes (ESC [ A/B/C/D)
+   344 00000B4F 4883EC10            <1>     sub rsp, 16
+   345                              <1> .read_esc_1:
+   346 00000B53 BF00000000          <1>     mov rdi, 0
+   347 00000B58 4889E6              <1>     mov rsi, rsp
+   348 00000B5B BA01000000          <1>     mov rdx, 1
+   349 00000B60 B802000000          <1>     mov rax, 2                      ; SYS_READ
+   350 00000B65 0F05                <1>     syscall
+   351 00000B67 4885C0              <1>     test rax, rax
+   352 00000B6A 7E2B                <1>     jle .esc_done
+   353 00000B6C 8A0424              <1>     mov al, [rsp]
+   354 00000B6F 3C5B                <1>     cmp al, '['                     ; CSI
+   355 00000B71 7524                <1>     jne .esc_done
+   356                              <1> .read_esc_2:
+   357 00000B73 BF00000000          <1>     mov rdi, 0
+   358 00000B78 4889E6              <1>     mov rsi, rsp
+   359 00000B7B BA01000000          <1>     mov rdx, 1
+   360 00000B80 B802000000          <1>     mov rax, 2                      ; SYS_READ
+   361 00000B85 0F05                <1>     syscall
+   362 00000B87 4885C0              <1>     test rax, rax
+   363 00000B8A 7E0B                <1>     jle .esc_done
+   364 00000B8C 8A0424              <1>     mov al, [rsp]
+   365 00000B8F 3C41                <1>     cmp al, 'A'                     ; Up arrow
+   366 00000B91 740D                <1>     je .history_up
+   367 00000B93 3C42                <1>     cmp al, 'B'                     ; Down arrow
+   368 00000B95 7431                <1>     je .history_down
+   369                              <1>     ; Ignore other arrow keys (C=right, D=left)
+   370                              <1> .esc_done:
+   371 00000B97 4883C410            <1>     add rsp, 16
+   372 00000B9B E9FFFEFFFF          <1>     jmp .readline_loop
+   373                              <1> 
+   374                              <1> .history_up:
+   375 00000BA0 4883C410            <1>     add rsp, 16                     ; clean up esc read stack
+   376                              <1>     ; Check if there's history to browse
+   377 00000BA4 48833DEC0B000000    <1>     cmp qword [rel history_count], 0
+   378 00000BAC 0F84EDFEFFFF        <1>     je .readline_loop
+   379                              <1>     ; Decrement browse index (earlier in history)
+   380 00000BB2 4585FF              <1>     test r15d, r15d
+   381 00000BB5 0F84E4FEFFFF        <1>     jz .readline_loop               ; already at oldest
+   382 00000BBB 41FFCF              <1>     dec r15d
+   383 00000BBE E8A2000000          <1>     call history_display
+   384 00000BC3 E9D7FEFFFF          <1>     jmp .readline_loop
+   385                              <1> 
+   386                              <1> .history_down:
+   387 00000BC8 4883C410            <1>     add rsp, 16                     ; clean up esc read stack
+   388                              <1>     ; Increment browse index (later in history)
+   389 00000BCC 488B05C50B0000      <1>     mov rax, [rel history_count]
+   390 00000BD3 4139C7              <1>     cmp r15d, eax
+   391 00000BD6 0F83C3FEFFFF        <1>     jae .readline_loop              ; already at newest
+   392 00000BDC 41FFC7              <1>     inc r15d
+   393 00000BDF E881000000          <1>     call history_display
+   394 00000BE4 E9B6FEFFFF          <1>     jmp .readline_loop
+   395                              <1> 
+   396                              <1> .enter:
+   397                              <1>     ; Echo newline
+   398 00000BE9 50                  <1>     push rax
+   399 00000BEA C604240A            <1>     mov byte [rsp], 0x0A
+   400 00000BEE BF01000000          <1>     mov rdi, 1
+   401 00000BF3 4889E6              <1>     mov rsi, rsp
+   402 00000BF6 BA01000000          <1>     mov rdx, 1
+   403 00000BFB B801000000          <1>     mov rax, 1
+   404 00000C00 0F05                <1>     syscall
+   405 00000C02 58                  <1>     pop rax
+   406                              <1> 
+   407                              <1>     ; Null-terminate
+   408 00000C03 43C6043400          <1>     mov byte [r12 + r14], 0
+   409                              <1> 
+   410                              <1>     ; Add non-empty line to history
+   411 00000C08 4585F6              <1>     test r14d, r14d
+   412 00000C0B 7410                <1>     jz .return_line
+   413                              <1> 
+   414 00000C0D 4154                <1>     push r12
+   415 00000C0F 4156                <1>     push r14
+   416 00000C11 4C89E7              <1>     mov rdi, r12
+   417 00000C14 E8B9000000          <1>     call history_add
+   418 00000C19 415E                <1>     pop r14
+   419 00000C1B 415C                <1>     pop r12
+   420                              <1> 
+   421                              <1> .return_line:
+   422 00000C1D 4C89F0              <1>     mov rax, r14                    ; return line length
+   423 00000C20 415F                <1>     pop r15
+   424 00000C22 415E                <1>     pop r14
+   425 00000C24 415D                <1>     pop r13
+   426 00000C26 415C                <1>     pop r12
+   427 00000C28 5B                  <1>     pop rbx
+   428 00000C29 C3                  <1>     ret
+   429                              <1> 
+   430                              <1> .ctrl_d:
+   431                              <1>     ; Ctrl+D on empty line → exit
+   432 00000C2A 4585F6              <1>     test r14d, r14d
+   433 00000C2D 0F856CFEFFFF        <1>     jnz .readline_loop              ; not empty, ignore
+   434                              <1> 
+   435                              <1>     ; Send newline and return 0
+   436 00000C33 50                  <1>     push rax
+   437 00000C34 C604240A            <1>     mov byte [rsp], 0x0A
+   438 00000C38 BF01000000          <1>     mov rdi, 1
+   439 00000C3D 4889E6              <1>     mov rsi, rsp
+   440 00000C40 BA01000000          <1>     mov rdx, 1
+   441 00000C45 B801000000          <1>     mov rax, 1
+   442 00000C4A 0F05                <1>     syscall
+   443 00000C4C 58                  <1>     pop rax
+   444                              <1> 
+   445 00000C4D 31C0                <1>     xor eax, eax                    ; return 0 (empty line)
+   446 00000C4F 415F                <1>     pop r15
+   447 00000C51 415E                <1>     pop r14
+   448 00000C53 415D                <1>     pop r13
+   449 00000C55 415C                <1>     pop r12
+   450 00000C57 5B                  <1>     pop rbx
+   451 00000C58 C3                  <1>     ret
+   452                              <1> 
+   453                              <1> .eof:
+   454 00000C59 31C0                <1>     xor eax, eax
+   455 00000C5B 415F                <1>     pop r15
+   456 00000C5D 415E                <1>     pop r14
+   457 00000C5F 415D                <1>     pop r13
+   458 00000C61 415C                <1>     pop r12
+   459 00000C63 5B                  <1>     pop rbx
+   460 00000C64 C3                  <1>     ret
+   461                              <1> 
+   462                              <1> ; ── History display helper ───────────────────────────────────────────────────
+   463                              <1> ; Called from readline after up/down arrow.  Clears current line and
+   464                              <1> ; displays history entry at index r15.
+   465                              <1> ; Input: r15 = history browse index
+   466                              <1> ;        r12 = current buffer, r14 = current position (destroyed then reset)
+   467                              <1> ;        r13 = max length
+   468                              <1> history_display:
+   469 00000C65 50                  <1>     push rax
+   470 00000C66 51                  <1>     push rcx
+   471 00000C67 57                  <1>     push rdi
+   472 00000C68 56                  <1>     push rsi
+   473 00000C69 52                  <1>     push rdx
+   474                              <1> 
+   475                              <1>     ; Clear current line from cursor position back to prompt
+   476                              <1>     ; Move back to prompt position
+   477 00000C6A 4489F1              <1>     mov ecx, r14d                   ; number of chars to erase
+   478 00000C6D 85C9                <1>     test ecx, ecx
+   479 00000C6F 742D                <1>     jz .hd_show
+   480                              <1> 
+   481                              <1> .hd_erase_loop:
+   482                              <1>     ; Backspace: 0x08, space, 0x08
+   483 00000C71 C64424F008          <1>     mov byte [rsp - 16], 0x08
+   484 00000C76 BF01000000          <1>     mov rdi, 1
+   485 00000C7B 488D7424F0          <1>     lea rsi, [rsp - 16]
+   486 00000C80 BA01000000          <1>     mov rdx, 1
+   487 00000C85 B801000000          <1>     mov rax, 1
+   488 00000C8A 0F05                <1>     syscall
+   489                              <1> 
+   490 00000C8C C64424F020          <1>     mov byte [rsp - 16], 0x20
+   491 00000C91 0F05                <1>     syscall
+   492                              <1> 
+   493 00000C93 C64424F008          <1>     mov byte [rsp - 16], 0x08
+   494 00000C98 0F05                <1>     syscall
+   495                              <1> 
+   496 00000C9A FFC9                <1>     dec ecx
+   497 00000C9C 75D3                <1>     jnz .hd_erase_loop
+   498                              <1> 
+   499                              <1> .hd_show:
+   500                              <1>     ; Get history entry at index r15
+   501 00000C9E 488D3DF3060000      <1>     lea rdi, [rel history_buf]
+   502 00000CA5 4489F8              <1>     mov eax, r15d
+   503 00000CA8 B900010000          <1>     mov ecx, LINE_MAX
+   504 00000CAD F7E1                <1>     mul ecx
+   505 00000CAF 4801C7              <1>     add rdi, rax                    ; rdi = history entry
+   506                              <1> 
+   507                              <1>     ; Copy history into buffer
+   508 00000CB2 57                  <1>     push rdi
+   509 00000CB3 4C89E7              <1>     mov rdi, r12                    ; buffer
+   510 00000CB6 5E                  <1>     pop rsi                         ; history entry
+   511 00000CB7 E839020000          <1>     call strcpy
+   512 00000CBC 4189C6              <1>     mov r14d, eax                   ; r14 = new length
+   513                              <1> 
+   514                              <1>     ; Display the history entry text
+   515 00000CBF 4C89E6              <1>     mov rsi, r12
+   516 00000CC2 BF01000000          <1>     mov rdi, 1
+   517 00000CC7 E880F7FFFF          <1>     call write_str
+   518                              <1> 
+   519                              <1> .hd_done:
+   520 00000CCC 5A                  <1>     pop rdx
+   521 00000CCD 5E                  <1>     pop rsi
+   522 00000CCE 5F                  <1>     pop rdi
+   523 00000CCF 59                  <1>     pop rcx
+   524 00000CD0 58                  <1>     pop rax
+   525 00000CD1 C3                  <1>     ret
+   526                              <1> 
+   527                              <1> ;==============================================================================
+   528                              <1> ; history_add(line) — Add a line to the command history
+   529                              <1> ;
+   530                              <1> ; Input: rdi = null-terminated string
+   531                              <1> ;==============================================================================
+   532                              <1> history_add:
+   533 00000CD2 53                  <1>     push rbx
+   534 00000CD3 4154                <1>     push r12
+   535 00000CD5 4155                <1>     push r13
+   536 00000CD7 4156                <1>     push r14
+   537                              <1> 
+   538 00000CD9 4989FC              <1>     mov r12, rdi                    ; r12 = line
+   539 00000CDC E894F7FFFF          <1>     call strlen
+   540 00000CE1 4989C5              <1>     mov r13, rax                    ; r13 = line length
+   541                              <1> 
+   542                              <1>     ; Don't add duplicate of last entry
+   543 00000CE4 48833DAC0A000000    <1>     cmp qword [rel history_count], 0
+   544 00000CEC 7428                <1>     je .ha_do_add
+   545                              <1> 
+   546                              <1>     ; Get last history entry
+   547 00000CEE 488B05A30A0000      <1>     mov rax, [rel history_count]
+   548 00000CF5 48FFC8              <1>     dec rax
+   549 00000CF8 B900010000          <1>     mov ecx, LINE_MAX
+   550 00000CFD F7E1                <1>     mul ecx
+   551 00000CFF 4C8DB0[98130000]    <1>     lea r14, [rel history_buf + rax] ; r14 = last entry
+   551          ******************  <1>  warning: indirect address displacements cannot be RIP-relative [-w+other]
+   552                              <1> 
+   553                              <1>     ; Compare with current line
+   554 00000D06 4C89E7              <1>     mov rdi, r12
+   555 00000D09 4C89F6              <1>     mov rsi, r14
+   556 00000D0C E8CD010000          <1>     call strcmp
+   557 00000D11 4885C0              <1>     test rax, rax
+   558 00000D14 7460                <1>     jz .ha_done                     ; duplicate, skip
+   559                              <1> 
+   560                              <1> .ha_do_add:
+   561                              <1>     ; Check if we need to shift (history full)
+   562 00000D16 488B057B0A0000      <1>     mov rax, [rel history_count]
+   563 00000D1D 4883F804            <1>     cmp rax, HISTORY_DEPTH
+   564 00000D21 7221                <1>     jb .ha_no_shift
+   565                              <1> 
+   566                              <1>     ; Shift all entries up (remove oldest)
+   567 00000D23 B900030000          <1>     mov ecx, (HISTORY_DEPTH - 1) * LINE_MAX
+   568 00000D28 488D3D69060000      <1>     lea rdi, [rel history_buf]
+   569 00000D2F 488D3562070000      <1>     lea rsi, [rel history_buf + LINE_MAX]
+   570 00000D36 F3A4                <1>     rep movsb
+   571 00000D38 B803000000          <1>     mov rax, HISTORY_DEPTH - 1
+   572 00000D3D 488905540A0000      <1>     mov [rel history_count], rax
+   573                              <1> 
+   574                              <1> .ha_no_shift:
+   575                              <1>     ; Append new entry
+   576 00000D44 488B054D0A0000      <1>     mov rax, [rel history_count]
+   577 00000D4B B900010000          <1>     mov ecx, LINE_MAX
+   578 00000D50 F7E1                <1>     mul ecx
+   579 00000D52 488DB8[98130000]    <1>     lea rdi, [rel history_buf + rax] ; rdi = destination slot
+   579          ******************  <1>  warning: indirect address displacements cannot be RIP-relative [-w+other]
+   580                              <1> 
+   581                              <1>     ; Copy line into history
+   582 00000D59 4C89E6              <1>     mov rsi, r12
+   583 00000D5C E894010000          <1>     call strcpy
+   584                              <1> 
+   585                              <1>     ; Increment count
+   586 00000D61 48FF05300A0000      <1>     inc qword [rel history_count]
+   587                              <1> 
+   588                              <1>     ; Reset browse position
+   589 00000D68 488B05290A0000      <1>     mov rax, [rel history_count]
+   590 00000D6F 4889052A0A0000      <1>     mov [rel history_index], rax
+   591                              <1> 
+   592                              <1> .ha_done:
+   593 00000D76 415E                <1>     pop r14
+   594 00000D78 415D                <1>     pop r13
+   595 00000D7A 415C                <1>     pop r12
+   596 00000D7C 5B                  <1>     pop rbx
+   597 00000D7D C3                  <1>     ret
+   598                              <1> 
+   599                              <1> ;------------------------------------------------------------------------------
+   600                              <1> ; history_display_all — Print all history entries (for "history" builtin)
+   601                              <1> ;------------------------------------------------------------------------------
+   602                              <1> history_display_all:
+   603 00000D7E 53                  <1>     push rbx
+   604 00000D7F 4154                <1>     push r12
+   605 00000D81 4155                <1>     push r13
+   606                              <1> 
+   607 00000D83 4C8B250E0A0000      <1>     mov r12, [rel history_count]
+   608 00000D8A 4D85E4              <1>     test r12, r12
+   609 00000D8D 7464                <1>     jz .hda_done
+   610                              <1> 
+   611 00000D8F 4531ED              <1>     xor r13d, r13d                  ; index
+   612                              <1> .hda_loop:
+   613 00000D92 B900010000          <1>     mov ecx, LINE_MAX
+   614 00000D97 4489E8              <1>     mov eax, r13d
+   615 00000D9A F7E1                <1>     mul ecx
+   616 00000D9C 488D98[98130000]    <1>     lea rbx, [rel history_buf + rax]
+   616          ******************  <1>  warning: indirect address displacements cannot be RIP-relative [-w+other]
+   617                              <1> 
+   618                              <1>     ; Check for empty slot
+   619 00000DA3 803B00              <1>     cmp byte [rbx], 0
+   620 00000DA6 7443                <1>     je .hda_next
+   621                              <1> 
+   622                              <1>     ; Print "  N  command"
+   623 00000DA8 4155                <1>     push r13
+   624 00000DAA 4154                <1>     push r12
+   625                              <1> 
+   626 00000DAC C6042420            <1>     mov byte [rsp], ' '
+   627 00000DB0 BF01000000          <1>     mov rdi, 1
+   628 00000DB5 4889E6              <1>     mov rsi, rsp
+   629 00000DB8 BA01000000          <1>     mov rdx, 1
+   630 00000DBD B801000000          <1>     mov rax, 1
+   631 00000DC2 0F05                <1>     syscall
+   632                              <1> 
+   633                              <1>     ; Print index (1-based)
+   634 00000DC4 4C89E8              <1>     mov rax, r13
+   635 00000DC7 48FFC0              <1>     inc rax
+   636 00000DCA E8D7F4FFFF          <1>     call print_decimal
+   637                              <1> 
+   638 00000DCF C6042420            <1>     mov byte [rsp], ' '
+   639 00000DD3 0F05                <1>     syscall
+   640                              <1> 
+   641 00000DD5 BF01000000          <1>     mov rdi, 1
+   642 00000DDA 4889DE              <1>     mov rsi, rbx
+   643 00000DDD E86AF6FFFF          <1>     call write_str
+   644 00000DE2 E89CF6FFFF          <1>     call write_newline
+   645                              <1> 
+   646 00000DE7 415C                <1>     pop r12
+   647 00000DE9 415D                <1>     pop r13
+   648                              <1> 
+   649                              <1> .hda_next:
+   650 00000DEB 41FFC5              <1>     inc r13d
+   651 00000DEE 4539E5              <1>     cmp r13d, r12d
+   652 00000DF1 729F                <1>     jb .hda_loop
+   653                              <1> 
+   654                              <1> .hda_done:
+   655 00000DF3 415D                <1>     pop r13
+   656 00000DF5 415C                <1>     pop r12
+   657 00000DF7 5B                  <1>     pop rbx
+   658 00000DF8 C3                  <1>     ret
+   659                              <1> 
+   660                              <1> ;==============================================================================
+   661                              <1> ; parse_line(buf, argv, max_args) — Split line into argv array
+   662                              <1> ;
+   663                              <1> ; Input:  rdi = null-terminated input line
+   664                              <1> ;         rsi = argv buffer (array of pointers)
+   665                              <1> ;         ecx = max args
+   666                              <1> ; Output: rax = argc
+   667                              <1> ;
+   668                              <1> ; Splits on whitespace (space, tab).  Handles single and double quotes.
+   669                              <1> ; Destroys buf content (inserts null terminators).
+   670                              <1> ;==============================================================================
+   671                              <1> parse_line:
+   672 00000DF9 53                  <1>     push rbx
+   673 00000DFA 4154                <1>     push r12
+   674 00000DFC 4155                <1>     push r13
+   675 00000DFE 4156                <1>     push r14
+   676 00000E00 4157                <1>     push r15
+   677                              <1> 
+   678 00000E02 4989FC              <1>     mov r12, rdi                    ; r12 = input pointer
+   679 00000E05 4989F5              <1>     mov r13, rsi                    ; r13 = argv buffer
+   680 00000E08 4189CE              <1>     mov r14d, ecx                   ; r14 = max args
+   681 00000E0B 4531FF              <1>     xor r15d, r15d                  ; r15 = argc
+   682                              <1> 
+   683                              <1> .pl_skip_ws:
+   684                              <1>     ; Skip leading whitespace
+   685 00000E0E 418A0424            <1>     mov al, [r12]
+   686 00000E12 84C0                <1>     test al, al
+   687 00000E14 0F8493000000        <1>     jz .pl_done
+   688 00000E1A 3C20                <1>     cmp al, ' '
+   689 00000E1C 7406                <1>     je .pl_skip_char
+   690 00000E1E 3C09                <1>     cmp al, 0x09                    ; tab
+   691 00000E20 7402                <1>     je .pl_skip_char
+   692 00000E22 EB05                <1>     jmp .pl_token_start
+   693                              <1> 
+   694                              <1> .pl_skip_char:
+   695 00000E24 49FFC4              <1>     inc r12
+   696 00000E27 EBE5                <1>     jmp .pl_skip_ws
+   697                              <1> 
+   698                              <1> .pl_token_start:
+   699                              <1>     ; Check for max args
+   700 00000E29 4539F7              <1>     cmp r15d, r14d
+   701 00000E2C 737F                <1>     jae .pl_done
+   702                              <1> 
+   703                              <1>     ; Store pointer in argv
+   704 00000E2E 4F8964FD00          <1>     mov [r13 + r15*8], r12
+   705 00000E33 41FFC7              <1>     inc r15d
+   706                              <1> 
+   707                              <1>     ; Parse token: handle quoted vs unquoted
+   708 00000E36 41803C2422          <1>     cmp byte [r12], '"'
+   709 00000E3B 7409                <1>     je .pl_double_quote
+   710 00000E3D 41803C2427          <1>     cmp byte [r12], 0x27            ; single quote
+   711 00000E42 7422                <1>     je .pl_single_quote
+   712 00000E44 EB40                <1>     jmp .pl_unquoted
+   713                              <1> 
+   714                              <1> .pl_double_quote:
+   715 00000E46 49FFC4              <1>     inc r12                         ; skip opening "
+   716                              <1> .dq_loop:
+   717 00000E49 41803C2422          <1>     cmp byte [r12], '"'
+   718 00000E4E 740C                <1>     je .dq_close
+   719 00000E50 41803C2400          <1>     cmp byte [r12], 0
+   720 00000E55 7456                <1>     je .pl_done
+   721 00000E57 49FFC4              <1>     inc r12
+   722 00000E5A EBED                <1>     jmp .dq_loop
+   723                              <1> .dq_close:
+   724 00000E5C 41C6042400          <1>     mov byte [r12], 0               ; null-terminate at closing "
+   725 00000E61 49FFC4              <1>     inc r12
+   726 00000E64 EBA8                <1>     jmp .pl_skip_ws
+   727                              <1> 
+   728                              <1> .pl_single_quote:
+   729 00000E66 49FFC4              <1>     inc r12                         ; skip opening '
+   730                              <1> .sq_loop:
+   731 00000E69 41803C2427          <1>     cmp byte [r12], 0x27
+   732 00000E6E 740C                <1>     je .sq_close
+   733 00000E70 41803C2400          <1>     cmp byte [r12], 0
+   734 00000E75 7436                <1>     je .pl_done
+   735 00000E77 49FFC4              <1>     inc r12
+   736 00000E7A EBED                <1>     jmp .sq_loop
+   737                              <1> .sq_close:
+   738 00000E7C 41C6042400          <1>     mov byte [r12], 0               ; null-terminate at closing '
+   739 00000E81 49FFC4              <1>     inc r12
+   740 00000E84 EB88                <1>     jmp .pl_skip_ws
+   741                              <1> 
+   742                              <1> .pl_unquoted:
+   743 00000E86 41803C2420          <1>     cmp byte [r12], ' '
+   744 00000E8B 7413                <1>     je .pl_end_token
+   745 00000E8D 41803C2409          <1>     cmp byte [r12], 0x09            ; tab
+   746 00000E92 740C                <1>     je .pl_end_token
+   747 00000E94 41803C2400          <1>     cmp byte [r12], 0
+   748 00000E99 7412                <1>     je .pl_done
+   749 00000E9B 49FFC4              <1>     inc r12
+   750 00000E9E EBE6                <1>     jmp .pl_unquoted
+   751                              <1> 
+   752                              <1> .pl_end_token:
+   753 00000EA0 41C6042400          <1>     mov byte [r12], 0               ; null-terminate token
+   754 00000EA5 49FFC4              <1>     inc r12
+   755 00000EA8 E961FFFFFF          <1>     jmp .pl_skip_ws
+   756                              <1> 
+   757                              <1> .pl_done:
+   758 00000EAD 4C89F8              <1>     mov rax, r15                    ; return argc
+   759 00000EB0 415F                <1>     pop r15
+   760 00000EB2 415E                <1>     pop r14
+   761 00000EB4 415D                <1>     pop r13
+   762 00000EB6 415C                <1>     pop r12
+   763 00000EB8 5B                  <1>     pop rbx
+   764 00000EB9 C3                  <1>     ret
+   765                              <1> 
+   766                              <1> ;==============================================================================
+   767                              <1> ; shell_help — Print help text for builtins
+   768                              <1> ;==============================================================================
+   769                              <1> shell_help:
+   770 00000EBA 53                  <1>     push rbx
+   771 00000EBB 4154                <1>     push r12
+   772                              <1> 
+   773 00000EBD 488D35EB000000      <1>     lea rsi, [rel str_help_text]
+   774 00000EC4 BF01000000          <1>     mov rdi, 1
+   775 00000EC9 E87EF5FFFF          <1>     call write_str
+   776                              <1> 
+   777 00000ECE 415C                <1>     pop r12
+   778 00000ED0 5B                  <1>     pop rbx
+   779 00000ED1 C3                  <1>     ret
+   780                              <1> 
+   781                              <1> ;==============================================================================
+   782                              <1> ; shell_history — Print command history (for "history" builtin)
+   783                              <1> ;==============================================================================
+   784                              <1> shell_history:
+   785 00000ED2 53                  <1>     push rbx
+   786 00000ED3 4154                <1>     push r12
+   787                              <1> 
+   788 00000ED5 E8A4FEFFFF          <1>     call history_display_all
+   789                              <1> 
+   790 00000EDA 415C                <1>     pop r12
+   791 00000EDC 5B                  <1>     pop rbx
+   792 00000EDD C3                  <1>     ret
+   793                              <1> 
+   794                              <1> ;==============================================================================
+   795                              <1> ; strcmp(rdi=s1, rsi=s2) → rax=0 if equal, !=0 otherwise
+   796                              <1> ;==============================================================================
+   797                              <1> strcmp:
+   798 00000EDE 31C0                <1>     xor eax, eax
+   799                              <1> .sc_loop:
+   800 00000EE0 8A07                <1>     mov al, [rdi]
+   801 00000EE2 8A0E                <1>     mov cl, [rsi]
+   802 00000EE4 28C8                <1>     sub al, cl
+   803 00000EE6 750C                <1>     jnz .sc_done
+   804 00000EE8 84C9                <1>     test cl, cl
+   805 00000EEA 7408                <1>     jz .sc_done
+   806 00000EEC 48FFC7              <1>     inc rdi
+   807 00000EEF 48FFC6              <1>     inc rsi
+   808 00000EF2 EBEC                <1>     jmp .sc_loop
+   809                              <1> .sc_done:
+   810 00000EF4 C3                  <1>     ret
+   811                              <1> 
+   812                              <1> ;==============================================================================
+   813                              <1> ; strcpy(rdi=dst, rsi=src) → rax = bytes copied
+   814                              <1> ;==============================================================================
+   815                              <1> strcpy:
+   816 00000EF5 51                  <1>     push rcx
+   817 00000EF6 31C9                <1>     xor ecx, ecx
+   818                              <1> .sp_loop:
+   819 00000EF8 8A040E              <1>     mov al, [rsi + rcx]
+   820 00000EFB 88040F              <1>     mov [rdi + rcx], al
+   821 00000EFE 84C0                <1>     test al, al
+   822 00000F00 7404                <1>     jz .sp_done
+   823 00000F02 FFC1                <1>     inc ecx
+   824 00000F04 EBF2                <1>     jmp .sp_loop
+   825                              <1> .sp_done:
+   826 00000F06 4889C8              <1>     mov rax, rcx
+   827 00000F09 59                  <1>     pop rcx
+   828 00000F0A C3                  <1>     ret
+   829                              <1> 
+   830                              <1> ;==============================================================================
+   831                              <1> ; Data section
+   832                              <1> ;==============================================================================
+   833                              <1> ; These must come after the code and before the section ends.
+   834                              <1> ; The data is placed in .text for flat binary flatness.
+   835                              <1> 
+   836                              <1> ; ── Strings ───────────────────────────────────────────────────────────────────
+   837 00000F0B 7669626978242000    <1> str_prompt:        db PROMPT_STR, 0
+   838 00000F13 564942495820496E74- <1> str_welcome:       db "VIBIX Interactive Shell v0.1", 0
+   838 00000F1C 657261637469766520- <1>
+   838 00000F25 5368656C6C2076302E- <1>
+   838 00000F2E 3100                <1>
+   839 00000F30 476F6F646279652100  <1> str_bye:           db "Goodbye!", 0
+   840 00000F39 6578697400          <1> str_exit:          db "exit", 0
+   841 00000F3E 68656C7000          <1> str_help:          db "help", 0
+   842 00000F43 686973746F727900    <1> str_history_cmd:   db "history", 0
+   843 00000F4B 636C65617200        <1> str_clear:         db "clear", 0
+   844 00000F51 706F7765726F666600  <1> str_poweroff_cmd:  db "poweroff", 0
+   845 00000F5A 7265626F6F7400      <1> str_reboot_cmd:    db "reboot", 0
+   846 00000F61 56494249543A20706F- <1> str_poweroff_msg:  db "VIBIT: poweroff requested", 0
+   846 00000F6A 7765726F6666207265- <1>
+   846 00000F73 7175657374656400    <1>
+   847 00000F7B 56494249543A207265- <1> str_reboot_msg:    db "VIBIT: reboot requested", 0
+   847 00000F84 626F6F742072657175- <1>
+   847 00000F8D 657374656400        <1>
+   848 00000F93 76696269783A2000    <1> str_not_found_1:   db "vibix: ", 0
+   849 00000F9B 3A20636F6D6D616E64- <1> str_not_found_2:   db ": command not found", 0
+   849 00000FA4 206E6F7420666F756E- <1>
+   849 00000FAD 6400                <1>
+   850                              <1> 
+   851                              <1> str_help_text:
+   852 00000FAF 417661696C61626C65- <1>     db "Available commands:", 0x0A
+   852 00000FB8 20636F6D6D616E6473- <1>
+   852 00000FC1 3A0A                <1>
+   853 00000FC3 20206563686F205B61- <1>     db "  echo [args]     — print arguments", 0x0A
+   853 00000FCC 7267735D2020202020- <1>
+   853 00000FD5 E28094207072696E74- <1>
+   853 00000FDE 20617267756D656E74- <1>
+   853 00000FE7 730A                <1>
+   854 00000FE9 202063617420202020- <1>     db "  cat             — copy stdin to stdout (Ctrl+D to exit)", 0x0A
+   854 00000FF2 202020202020202020- <1>
+   854 00000FFB E2809420636F707920- <1>
+   854 00001004 737464696E20746F20- <1>
+   854 0000100D 7374646F7574202843- <1>
+   854 00001016 74726C2B4420746F20- <1>
+   854 0000101F 65786974290A        <1>
+   855 00001025 20207072696E74656E- <1>     db "  printenv [var]  — print environment variables", 0x0A
+   855 0000102E 76205B7661725D2020- <1>
+   855 00001037 E28094207072696E74- <1>
+   855 00001040 20656E7669726F6E6D- <1>
+   855 00001049 656E74207661726961- <1>
+   855 00001052 626C65730A          <1>
+   856 00001057 2020636C6561722020- <1>     db "  clear           — clear terminal", 0x0A
+   856 00001060 202020202020202020- <1>
+   856 00001069 E2809420636C656172- <1>
+   856 00001072 207465726D696E616C- <1>
+   856 0000107B 0A                  <1>
+   857 0000107C 202074727565202020- <1>     db "  true            — exit with code 0", 0x0A
+   857 00001085 202020202020202020- <1>
+   857 0000108E E28094206578697420- <1>
+   857 00001097 7769746820636F6465- <1>
+   857 000010A0 20300A              <1>
+   858 000010A3 202066616C73652020- <1>     db "  false           — exit with code 1", 0x0A
+   858 000010AC 202020202020202020- <1>
+   858 000010B5 E28094206578697420- <1>
+   858 000010BE 7769746820636F6465- <1>
+   858 000010C7 20310A              <1>
+   859 000010CA 202065786974202020- <1>     db "  exit            — exit shell", 0x0A
+   859 000010D3 202020202020202020- <1>
+   859 000010DC E28094206578697420- <1>
+   859 000010E5 7368656C6C0A        <1>
+   860 000010EB 202068656C70202020- <1>     db "  help            — show this help", 0x0A
+   860 000010F4 202020202020202020- <1>
+   860 000010FD E280942073686F7720- <1>
+   860 00001106 746869732068656C70- <1>
+   860 0000110F 0A                  <1>
+   861 00001110 2020686973746F7279- <1>     db "  history         — show command history", 0x0A
+   861 00001119 202020202020202020- <1>
+   861 00001122 E280942073686F7720- <1>
+   861 0000112B 636F6D6D616E642068- <1>
+   861 00001134 6973746F72790A      <1>
+   862 0000113B 2020706F7765726F66- <1>     db "  poweroff        — power off the system", 0x0A
+   862 00001144 662020202020202020- <1>
+   862 0000114D E2809420706F776572- <1>
+   862 00001156 206F66662074686520- <1>
+   862 0000115F 73797374656D0A      <1>
+   863 00001166 20207265626F6F7420- <1>     db "  reboot          — reboot the system", 0x0A
+   863 0000116F 202020202020202020- <1>
+   863 00001178 E28094207265626F6F- <1>
+   863 00001181 742074686520737973- <1>
+   863 0000118A 74656D0A            <1>
+   864 0000118E 00                  <1>     db 0
+   865                              <1> 
+   866                              <1> ; ── Command table ────────────────────────────────────────────────────────────
+   867                              <1> ; Entries: dq name_ptr, function_ptr, ... terminated by dq 0
+   868                              <1> cmd_table:
+   869 0000118F [F711000000000000]- <1>     dq str_cat_name, cat
+   869 00001197 [2407000000000000]  <1>
+   870 0000119F [FB11000000000000]- <1>     dq str_echo_name, echo
+   870 000011A7 [1205000000000000]  <1>
+   871 000011AF [0012000000000000]- <1>     dq str_printenv_name, printenv
+   871 000011B7 [6707000000000000]  <1>
+   872 000011BF [4B0F000000000000]- <1>     dq str_clear, clear_cmd
+   872 000011C7 [EF07000000000000]  <1>
+   873 000011CF [0912000000000000]- <1>     dq str_true_name, true_func
+   873 000011D7 [E704000000000000]  <1>
+   874 000011DF [0E12000000000000]- <1>     dq str_false_name, false_func
+   874 000011E7 [EA04000000000000]  <1>
+   875 000011EF 0000000000000000    <1>     dq 0    ; terminator
+   876                              <1> 
+   877 000011F7 63617400            <1> str_cat_name:      db "cat", 0
+   878 000011FB 6563686F00          <1> str_echo_name:     db "echo", 0
+   879 00001200 7072696E74656E7600  <1> str_printenv_name: db "printenv", 0
+   880 00001209 7472756500          <1> str_true_name:     db "true", 0
+   881 0000120E 66616C736500        <1> str_false_name:    db "false", 0
+   882                              <1> 
+   883                              <1> ; ── Buffers ──────────────────────────────────────────────────────────────────
+   884                              <1> ; Allocated after code in the flat binary
+   885 00001214 90<rep 4h>          <1> align 8
+   886 00001218 <res 100h>          <1> input_line:      resb LINE_MAX     ; current input line
+   886          ******************  <1>  warning: uninitialized space declared in .text section: zeroing [-w+zeroing]
+   887 00001318 <res 80h>           <1> argv_buf:        resq MAX_ARGS     ; parsed argument pointers
+   887          ******************  <1>  warning: uninitialized space declared in .text section: zeroing [-w+zeroing]
+   888 00001398 <res 400h>          <1> history_buf:     resb HISTORY_DEPTH * LINE_MAX  ; circular history buffer
+   888          ******************  <1>  warning: uninitialized space declared in .text section: zeroing [-w+zeroing]
+   889 00001798 ????????????????    <1> history_count:   resq 1            ; number of entries in history
+   889          ******************  <1>  warning: uninitialized space declared in .text section: zeroing [-w+zeroing]
+   890 000017A0 ????????????????    <1> history_index:   resq 1            ; current browse position
+   890          ******************  <1>  warning: uninitialized space declared in .text section: zeroing [-w+zeroing]
