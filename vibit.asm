@@ -415,8 +415,8 @@ print_decimal:
     test rax, rax
     jnz .convert
     inc r13
+    mov rdi, r13
     mov rsi, r13
-    mov rdi, 1
     call strlen
     mov rdx, rax
     mov rax, SYS_WRITE
